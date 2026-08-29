@@ -12,6 +12,7 @@ namespace Steam2Browser;
 ///
 /// Keys we care about are 4-byte little-endian integers:
 ///   0  -> format code (3 or 4)
+///   3  -> nested compressed blob holding the file manifest
 ///   12 -> CRC of the parent blob, i.e. the previous link in the delta chain
 ///   13 -> size of the matching .dat (u32 when format code is 3, u64 when it is 4)
 /// </summary>
@@ -22,24 +23,19 @@ public static class BlobFormat
 
     public sealed record BlobInfo(uint FormatCode, uint? ParentCrc, ulong? DatSize);
 
-    public static BlobInfo Parse(ReadOnlySpan<byte> raw)
+    /// <summary>Reads every 4-byte-integer key into a dictionary, unwrapping compression if present.</summary>
+    public static Dictionary<uint, byte[]> ReadKeys(ReadOnlySpan<byte> raw)
     {
-        byte[]? rented = null;
+        var result = new Dictionary<uint, byte[]>();
+
         if (raw.Length >= 2 && BinaryPrimitives.ReadUInt16LittleEndian(raw) == MagicCompressed)
-        {
-            rented = Decompress(raw);
-            raw = rented;
-        }
+            raw = Decompress(raw);
 
         if (raw.Length < 10 || BinaryPrimitives.ReadUInt16LittleEndian(raw) != MagicPlain)
             throw new InvalidDataException("blob: bad magic");
 
         uint totalSize = BinaryPrimitives.ReadUInt32LittleEndian(raw[2..]);
         int end = (int)Math.Min(totalSize, (uint)raw.Length);
-
-        uint? formatCode = null, parentCrc = null;
-        ulong? datSize = null;
-        ReadOnlySpan<byte> datSizeValue = default;
 
         int pos = 10;
         while (pos + 6 <= end)
@@ -50,32 +46,43 @@ public static class BlobFormat
 
             if (pos + keySize + (long)valueSize > end) break;
 
-            var key = raw.Slice(pos, keySize);
-            var value = raw.Slice(pos + keySize, (int)valueSize);
-
             if (keySize == 4)
             {
-                uint k = BinaryPrimitives.ReadUInt32LittleEndian(key);
-                if (k == 0 && valueSize == 4) formatCode = BinaryPrimitives.ReadUInt32LittleEndian(value);
-                else if (k == 12 && valueSize == 4) parentCrc = BinaryPrimitives.ReadUInt32LittleEndian(value);
-                else if (k == 13) datSizeValue = value;
+                uint key = BinaryPrimitives.ReadUInt32LittleEndian(raw.Slice(pos, keySize));
+                result[key] = raw.Slice(pos + keySize, (int)valueSize).ToArray();
             }
 
             pos += keySize + (int)valueSize;
         }
 
-        // Key 13 is u32 for format code 3 and u64 for format code 4; fall back to the actual width.
-        if (!datSizeValue.IsEmpty)
+        return result;
+    }
+
+    public static BlobInfo Parse(ReadOnlySpan<byte> raw)
+    {
+        var keys = ReadKeys(raw);
+
+        uint formatCode = keys.TryGetValue(0, out var fc) && fc.Length == 4
+            ? BinaryPrimitives.ReadUInt32LittleEndian(fc)
+            : 0;
+
+        uint? parentCrc = keys.TryGetValue(12, out var pc) && pc.Length == 4
+            ? BinaryPrimitives.ReadUInt32LittleEndian(pc)
+            : null;
+
+        // Key 13 is u32 for format code 3 and u64 for format code 4; trust the actual width.
+        ulong? datSize = null;
+        if (keys.TryGetValue(13, out var ds))
         {
-            datSize = datSizeValue.Length switch
+            datSize = ds.Length switch
             {
-                4 => BinaryPrimitives.ReadUInt32LittleEndian(datSizeValue),
-                8 => BinaryPrimitives.ReadUInt64LittleEndian(datSizeValue),
+                4 => BinaryPrimitives.ReadUInt32LittleEndian(ds),
+                8 => BinaryPrimitives.ReadUInt64LittleEndian(ds),
                 _ => null
             };
         }
 
-        return new BlobInfo(formatCode ?? 0, parentCrc, datSize);
+        return new BlobInfo(formatCode, parentCrc, datSize);
     }
 
     private static byte[] Decompress(ReadOnlySpan<byte> raw)

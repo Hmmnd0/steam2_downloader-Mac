@@ -17,16 +17,27 @@ public sealed class Settings
     public int Concurrency { get; set; } = 8;
     public bool VerifyHashes { get; set; } = true;
 
-    public string ExtractExePath { get; set; } = "";
     public string ExtractOutDir { get; set; } = "";
 
     [JsonIgnore] public string ConfigPath { get; set; } = "";
+
+    /// <summary>Everything the app writes lives here, in one folder beside the executable.</summary>
+    public const string RootFolder = "steam2info";
+
+    public static string RootFor(string baseDir) => Path.Combine(baseDir, RootFolder);
 
     private static readonly JsonSerializerOptions JsonOpts = new() { WriteIndented = true };
 
     public static Settings Load(string baseDir)
     {
-        string path = Path.Combine(baseDir, "settings.json");
+        string root = RootFor(baseDir);
+        Directory.CreateDirectory(root);
+
+        // Installs from before the move kept their files loose beside the exe; bring them along.
+        Migrate(baseDir, root, "settings.json");
+        Migrate(baseDir, root, "names.jsonl");
+
+        string path = Path.Combine(root, "settings.json");
         Settings s;
         try
         {
@@ -40,11 +51,25 @@ public sealed class Settings
         }
 
         s.ConfigPath = path;
-        if (string.IsNullOrWhiteSpace(s.DataDir)) s.DataDir = Path.Combine(baseDir, "archive");
-        if (string.IsNullOrWhiteSpace(s.IndexDir)) s.IndexDir = Path.Combine(baseDir, "index");
-        if (string.IsNullOrWhiteSpace(s.ExtractOutDir)) s.ExtractOutDir = Path.Combine(baseDir, "extracted");
+        if (string.IsNullOrWhiteSpace(s.DataDir)) s.DataDir = Path.Combine(root, "archive");
+        if (string.IsNullOrWhiteSpace(s.IndexDir)) s.IndexDir = Path.Combine(root, "index");
+        if (string.IsNullOrWhiteSpace(s.ExtractOutDir)) s.ExtractOutDir = Path.Combine(root, "extracted");
         if (s.Concurrency is < 1 or > 64) s.Concurrency = 8;
         return s;
+    }
+
+    private static void Migrate(string baseDir, string root, string name)
+    {
+        try
+        {
+            string old = Path.Combine(baseDir, name);
+            string moved = Path.Combine(root, name);
+            if (File.Exists(old) && !File.Exists(moved)) File.Move(old, moved);
+        }
+        catch
+        {
+            // Starting fresh is an acceptable outcome here.
+        }
     }
 
     public void Save()

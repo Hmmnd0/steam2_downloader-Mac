@@ -1,0 +1,25 @@
+# build output
+bin/
+obj/
+release/
+out/
+
+# everything the app writes at runtime
+steam2info/
+archive/
+extracted/
+index/
+names.jsonl
+settings.json
+
+# archive index files — ~30 MB, and the app fetches them from a mirror on first run
+dats_dates.txt
+blobs_dates.txt
+dats.sha256
+blobs.sha256
+
+# catalog snapshot embedded at build time — CI regenerates it on every release
+Steam2Browser/index.bin
+
+.vs/
+*.user

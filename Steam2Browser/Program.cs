@@ -30,7 +30,57 @@ var client = new ArchiveClient(http)
 };
 var loader = new IndexLoader(client, settings);
 var downloads = new DownloadManager(client, settings);
-var extractor = new ExtractorRunner(client, settings);
+var extractor = new ExtractorRunner(settings);
+var updates = new UpdateChecker(http);
+updates.Initialise();
+var names = new NameCache(client, http);
+names.Load(Settings.RootFor(baseDir));
+
+// Maintainer tool: `--build-index <path>` snapshots the whole catalog into one compact file, which
+// the build then embeds so a release needs no network on first run. Always pulls fresh from a
+// mirror rather than reusing local caches, since the point is to capture the archive as it is now.
+int buildIndexAt = Array.FindIndex(args, a => a.Equals("--build-index", StringComparison.OrdinalIgnoreCase));
+if (buildIndexAt >= 0)
+{
+    string outPath = Path.GetFullPath(
+        buildIndexAt + 1 < args.Length ? args[buildIndexAt + 1] : "index.bin");
+
+    // Sizes are the expensive part — two ~20 MB directory listings — so they are opt-in. Without
+    // them the snapshot still carries every name and date, and sizes fill in later on demand.
+    bool withSizes = args.Contains("--with-sizes", StringComparer.OrdinalIgnoreCase);
+
+    Console.WriteLine("building a compact index snapshot");
+    Console.WriteLine(withSizes
+        ? "  sizes requested: fetching two directory listings (~40 MB)"
+        : "  sizes skipped: pass --with-sizes to include them");
+
+    // Local dats_dates.txt / blobs_dates.txt are used when present, anywhere up the tree.
+    await loader.LoadAsync(refreshIndex: false, withSizes: false, ignoreEmbedded: true);
+    if (loader.Catalog is null)
+    {
+        Console.Error.WriteLine($"  failed: {loader.Status.Error ?? loader.Status.Message}");
+        return 1;
+    }
+    Console.WriteLine($"  index: {loader.Status.Message}");
+
+    if (withSizes)
+    {
+        await loader.LoadSizesAsync(force: true);
+        Console.WriteLine($"  sizes: {loader.Status.Message}");
+    }
+
+    var cat = loader.Catalog;
+    Directory.CreateDirectory(Path.GetDirectoryName(outPath)!);
+    CompactIndex.Write(
+        outPath,
+        cat.Ordered.SelectMany(d => d.Dats),
+        cat.Ordered.SelectMany(d => d.Blobs));
+
+    Console.WriteLine($"  wrote {outPath} ({new FileInfo(outPath).Length / 1048576.0:0.00} MB) " +
+                      $"— {cat.Ordered.Count} depots, {cat.DatCount + cat.BlobCount} files" +
+                      (cat.SizesLoaded ? ", with sizes" : ", no sizes"));
+    return 0;
+}
 
 var builder = WebApplication.CreateBuilder(new WebApplicationOptions { Args = args, ContentRootPath = baseDir });
 builder.Logging.ClearProviders();
@@ -73,6 +123,7 @@ app.MapGet("/api/state", () => new
             totalBytes = c.ApproxTotalBytes,
             sizesLoaded = c.SizesLoaded,
             resetDepots = c.Ordered.Count(d => d.HasReset),
+            keyedDepots = c.Ordered.Count(d => DepotKeys.Has(d.Id)),
             incompleteDepots = c.Ordered.Count(d => !d.IsComplete),
         }
         : null,
@@ -84,7 +135,6 @@ app.MapGet("/api/state", () => new
         settings.Failover,
         settings.Concurrency,
         settings.VerifyHashes,
-        settings.ExtractExePath,
         settings.ExtractOutDir,
     },
     mirrors = Mirrors.All.Select(m => new
@@ -93,6 +143,38 @@ app.MapGet("/api/state", () => new
         tested = m.TestedUtc,
         active = m.Id == client.Primary.Id,
     }),
+    update = new
+    {
+        updates.Status.State,
+        updates.Status.Message,
+        updates.Status.Repo,
+        updates.Status.RepoUrl,
+        updates.Status.BuiltUtc,
+        updates.Status.LatestCommitUtc,
+        updates.Status.CommitShort,
+        updates.Status.CommitMessage,
+        updates.Status.CommitAuthor,
+        updates.Status.CommitUrl,
+        updates.Status.CheckedUtc,
+    },
+    names = new
+    {
+        names.Status.Running,
+        names.Status.Cached,
+        names.Status.Named,
+        names.Status.Failed,
+        names.Status.Current,
+        names.Status.Message,
+    },
+    steam = new
+    {
+        names.Steam.Running,
+        names.Steam.Checked,
+        names.Steam.Found,
+        names.Steam.Remaining,
+        names.Steam.Current,
+        names.Steam.Message,
+    },
 });
 
 app.MapPost("/api/settings", (SettingsPatch patch) =>
@@ -102,7 +184,6 @@ app.MapPost("/api/settings", (SettingsPatch patch) =>
     if (patch.Concurrency is { } cc) settings.Concurrency = Math.Clamp(cc, 1, 64);
     if (patch.VerifyHashes is { } vh) settings.VerifyHashes = vh;
     if (!string.IsNullOrWhiteSpace(patch.DataDir)) settings.DataDir = patch.DataDir!;
-    if (!string.IsNullOrWhiteSpace(patch.ExtractExePath)) settings.ExtractExePath = patch.ExtractExePath!;
     if (!string.IsNullOrWhiteSpace(patch.ExtractOutDir)) settings.ExtractOutDir = patch.ExtractOutDir!;
     settings.Save();
     return Results.Ok(new { ok = true });
@@ -126,9 +207,33 @@ app.MapPost("/api/index/sizes", () =>
     return Results.Ok(new { ok = true });
 });
 
+app.MapPost("/api/names/start", (bool? retryFailed) =>
+{
+    if (loader.Catalog is null) return Results.BadRequest(new { error = "index not loaded yet" });
+    names.Start(loader.Catalog, retryFailed: retryFailed ?? false);
+    return Results.Ok(new { ok = true });
+});
+
+app.MapPost("/api/names/stop", () => { names.Stop(); return Results.Ok(new { ok = true }); });
+
+app.MapPost("/api/names/steam/start", (bool? recheckMisses) =>
+{
+    if (loader.Catalog is null) return Results.BadRequest(new { error = "index not loaded yet" });
+    names.StartSteam(loader.Catalog, recheckMisses ?? false);
+    return Results.Ok(new { ok = true });
+});
+
+app.MapPost("/api/names/steam/stop", () => { names.StopSteam(); return Results.Ok(new { ok = true }); });
+
+app.MapPost("/api/update/check", async (CancellationToken ct) =>
+{
+    await updates.CheckAsync(ct);
+    return Results.Ok(new { updates.Status.State, updates.Status.Message });
+});
+
 // ---------------- browsing ----------------
 
-app.MapGet("/api/depots", (string? q, string? sort, string? dir, string? filter, int skip, int take) =>
+app.MapGet("/api/depots", (string? q, string? sort, string? dir, string? filter, int? skip, int? take) =>
 {
     var cat = loader.Catalog;
     if (cat is null) return Results.Ok(new { total = 0, items = Array.Empty<object>() });
@@ -138,9 +243,29 @@ app.MapGet("/api/depots", (string? q, string? sort, string? dir, string? filter,
     if (!string.IsNullOrWhiteSpace(q))
     {
         var needle = q.Trim();
-        items = int.TryParse(needle, out int exact)
-            ? items.Where(d => d.Id == exact || d.Id.ToString().Contains(needle, StringComparison.Ordinal))
-            : items.Where(d => d.Id.ToString().Contains(needle, StringComparison.Ordinal));
+
+        // Wrapping the term in quotes asks for an exact match: "440" is depot 440 alone,
+        // where a bare 440 also brings back 4400, 14400 and every other id containing it.
+        bool exact = needle.Length >= 2
+                     && (needle[0] == '"' && needle[^1] == '"' || needle[0] == '\'' && needle[^1] == '\'');
+        if (exact) needle = needle[1..^1].Trim();
+
+        if (needle.Length == 0)
+        {
+            // A lone pair of quotes filters nothing.
+        }
+        else if (exact)
+        {
+            items = items.Where(d =>
+                d.Id.ToString() == needle ||
+                string.Equals(names.Get(d.Id)?.Display, needle, StringComparison.OrdinalIgnoreCase));
+        }
+        else
+        {
+            items = items.Where(d =>
+                d.Id.ToString().Contains(needle, StringComparison.Ordinal) ||
+                (names.Get(d.Id)?.Display.Contains(needle, StringComparison.OrdinalIgnoreCase) ?? false));
+        }
     }
 
     items = filter switch
@@ -170,13 +295,13 @@ app.MapGet("/api/depots", (string? q, string? sort, string? dir, string? filter,
         return desc ? -c : c;
     });
 
-    take = Math.Clamp(take <= 0 ? 200 : take, 1, 2000);
-    skip = Math.Max(0, skip);
+    int pageSize = Math.Clamp(take is null or <= 0 ? 200 : take.Value, 1, 2000);
+    int offset = Math.Max(0, skip ?? 0);
 
     return Results.Ok(new
     {
         total = list.Count,
-        items = list.Skip(skip).Take(take).Select(Dto.Summary),
+        items = list.Skip(offset).Take(pageSize).Select(d => Dto.Summary(d, names.Get(d.Id))),
     });
 });
 
@@ -190,7 +315,7 @@ app.MapGet("/api/depots/{id:int}", (int id) =>
 
     return Results.Ok(new
     {
-        summary = Dto.Summary(d),
+        summary = Dto.Summary(d, names.Get(d.Id)),
         versions = Enumerable.Range(0, d.MaxVersion + 1).Select(v => new
         {
             version = v,
@@ -200,13 +325,13 @@ app.MapGet("/api/depots/{id:int}", (int id) =>
     });
 });
 
-app.MapGet("/api/search", (string? q, int take) =>
+app.MapGet("/api/search", (string? q, int? take) =>
 {
     var cat = loader.Catalog;
     if (cat is null || string.IsNullOrWhiteSpace(q)) return Results.Ok(Array.Empty<object>());
 
     var needle = q.Trim();
-    take = Math.Clamp(take <= 0 ? 100 : take, 1, 500);
+    int limit = Math.Clamp(take is null or <= 0 ? 100 : take.Value, 1, 500);
 
     var hits = new List<object>();
     foreach (var d in cat.Ordered)
@@ -216,7 +341,7 @@ app.MapGet("/api/search", (string? q, int take) =>
             if (e.FileName.Contains(needle, StringComparison.OrdinalIgnoreCase))
             {
                 hits.Add(Dto.File(e, Path.Combine(settings.DataDir, e.DirName)));
-                if (hits.Count >= take) return Results.Ok(hits);
+                if (hits.Count >= limit) return Results.Ok(hits);
             }
         }
     }
@@ -253,9 +378,9 @@ app.MapGet("/api/jobs", () => downloads.Jobs
 app.MapPost("/api/jobs/{id}/cancel", (string id) => { downloads.Cancel(id); return Results.Ok(new { ok = true }); });
 app.MapPost("/api/jobs/clear", () => { downloads.Clear(); return Results.Ok(new { ok = true }); });
 
-app.MapPost("/api/extract", async (ExtractRequest req, CancellationToken ct) =>
+app.MapPost("/api/extract", (ExtractRequest req) =>
 {
-    var run = await extractor.StartAsync(req.Depot, req.Version, req.BlobCrc, req.Filter, ct);
+    var run = extractor.Start(req.Depot, req.Version, req.BlobCrc, req.Filter, req.KeyHex);
     return Results.Ok(new { runId = run.Id });
 });
 
@@ -263,8 +388,16 @@ app.MapGet("/api/extract", () => extractor.Runs
     .OrderByDescending(r => r.StartedUtc)
     .Select(r => new
     {
-        r.Id, r.Depot, r.Version, r.BlobCrc, r.CommandLine, r.Status, r.ExitCode, r.Error,
+        r.Id, r.Depot, r.Version, r.BlobCrc, r.OutDir, r.Status, r.Error,
         started = r.StartedUtc, finished = r.FinishedUtc,
+        progress = new
+        {
+            r.Progress.TotalFiles,
+            r.Progress.DoneFiles,
+            r.Progress.FailedFiles,
+            r.Progress.BytesWritten,
+            r.Progress.Current,
+        },
         log = r.Log.ToArray(),
     }));
 
@@ -289,7 +422,35 @@ app.MapPost("/api/reveal", (RevealRequest req) =>
 
 // ---------------- go ----------------
 
-_ = loader.LoadAsync(refreshIndex: false, withSizes: true);
+_ = updates.CheckAsync();
+
+// Startup: load the index, race the mirrors, switch to the fastest, then start naming depots.
+_ = Task.Run(async () =>
+{
+    await loader.LoadAsync(refreshIndex: false, withSizes: true);
+    if (loader.Catalog is null) return;
+
+    try
+    {
+        await Mirrors.TestAllAsync(http);
+        var best = Mirrors.All.Where(m => m.Reachable && m.SpeedBps > 0).MaxBy(m => m.SpeedBps);
+        if (best is not null && best.Id != client.Primary.Id)
+        {
+            client.Primary = best;
+            settings.MirrorId = best.Id;
+            settings.Save();
+        }
+    }
+    catch
+    {
+        // Keep whatever mirror is configured if the race fails.
+    }
+
+    // Both passes run together: the mirror sweep is bandwidth-bound and the Steam pass is
+    // rate-limited to well under one request a second, so neither holds the other up.
+    names.Start(loader.Catalog);
+    names.StartSteam(loader.Catalog);
+});
 
 string url = $"http://127.0.0.1:{port}/";
 Console.WriteLine($"steam2browser  ->  {url}");
@@ -303,23 +464,31 @@ if (!noBrowser)
 }
 
 app.Run();
+return 0;
 
 // ---------------- request bodies ----------------
 
 internal sealed record SettingsPatch(
     string? MirrorId, bool? Failover, int? Concurrency, bool? VerifyHashes,
-    string? DataDir, string? ExtractExePath, string? ExtractOutDir);
+    string? DataDir, string? ExtractOutDir);
 
 internal sealed record ReloadRequest(bool Refresh, bool Sizes);
 internal sealed record PlanRequest(int Depot, int Version, string? BlobCrc);
-internal sealed record ExtractRequest(int Depot, int Version, string? BlobCrc, string? Filter);
+internal sealed record ExtractRequest(int Depot, int Version, string? BlobCrc, string? Filter, string? KeyHex);
 internal sealed record RevealRequest(string Path);
 
 internal static class Dto
 {
-    public static object Summary(Depot d) => new
+    public static object Summary(Depot d, NameRecord? name = null) => new
     {
         id = d.Id,
+        name = string.IsNullOrEmpty(name?.Display) ? null : name!.Display,
+        nameSource = name is null ? null : string.IsNullOrEmpty(name.SteamName) ? "manifest" : "steam",
+        manifestName = string.IsNullOrEmpty(name?.Label) ? null : name!.Label,
+        steamType = name?.SteamType,
+        roots = name?.Roots,
+        manifestAppId = name is { Error: null } ? name.AppId : (uint?)null,
+        nameError = name?.Error,
         versions = d.DistinctVersions,
         maxVersion = d.MaxVersion,
         dats = d.Dats.Count,
@@ -328,6 +497,10 @@ internal static class Dto
         blobBytes = d.ApproxBlobBytes,
         first = d.FirstDate == default ? null : d.FirstDate.ToString("yyyy-MM-dd"),
         last = d.LastDate == default ? null : d.LastDate.ToString("yyyy-MM-dd"),
+        hasKey = DepotKeys.Has(d.Id),
+        // Whether it is encrypted at all is the real question; the key table only matters if it is.
+        encrypted = name?.Encrypted,
+        needsKey = name?.Encrypted == true && !DepotKeys.Has(d.Id),
         hasReset = d.HasReset,
         forkedVersions = d.ForkedVersions,
         complete = d.IsComplete,

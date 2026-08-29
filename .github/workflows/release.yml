@@ -1,0 +1,118 @@
+name: build and release
+
+# Quoted: bare `on` is the boolean true in YAML 1.1, which trips up local linters.
+"on":
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Needed so the workflow can publish a release.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Build catalog snapshot
+        shell: pwsh
+        # Pulls the index and directory listings once and compacts them to ~4.5 MB, which the
+        # publish step below embeds. Best effort: if the mirrors are unreachable from the runner
+        # the release still ships, and the app falls back to fetching the index itself.
+        continue-on-error: true
+        run: |
+          dotnet run --project Steam2Browser/Steam2Browser.csproj -c Release `
+            -- --build-index Steam2Browser/index.bin --with-sizes
+
+      - name: Report snapshot
+        shell: pwsh
+        run: |
+          if (Test-Path Steam2Browser/index.bin) {
+            $mb = (Get-Item Steam2Browser/index.bin).Length / 1MB
+            Write-Host ("embedding a catalog snapshot of {0:N2} MB" -f $mb)
+            "SNAPSHOT=yes" | Out-File -Append $env:GITHUB_ENV
+          } else {
+            Write-Host 'no snapshot — the app will fetch the index on first run'
+            "SNAPSHOT=no" | Out-File -Append $env:GITHUB_ENV
+          }
+
+      - name: Publish
+        shell: pwsh
+        run: |
+          dotnet publish Steam2Browser/Steam2Browser.csproj `
+            -c Release -r win-x64 --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:EnableCompressionInSingleFile=true `
+            -p:PublishTrimmed=false `
+            -p:DebugType=none `
+            -o publish
+
+      - name: Trim publish leftovers
+        shell: pwsh
+        # The UI and the depot key table are embedded in the exe, so the loose copies
+        # ASP.NET emits are dead weight. web.config only matters under IIS.
+        run: |
+          Remove-Item -Recurse -Force publish/wwwroot -ErrorAction SilentlyContinue
+          Remove-Item -Force publish/web.config -ErrorAction SilentlyContinue
+          Remove-Item -Force publish/*.staticwebassets.endpoints.json -ErrorAction SilentlyContinue
+          Get-ChildItem publish
+
+      - name: Smoke test
+        shell: pwsh
+        # Catches a build that publishes but cannot start — the embedded UI failing to
+        # resolve would otherwise only show up on a user's machine.
+        run: |
+          $exe = Start-Process -FilePath publish/steam2browser.exe `
+            -ArgumentList '--no-browser','--port=5099' -PassThru
+          $ok = $false
+          foreach ($i in 1..30) {
+            Start-Sleep -Seconds 2
+            try {
+              $r = Invoke-WebRequest -Uri http://127.0.0.1:5099/ -TimeoutSec 5 -UseBasicParsing
+              if ($r.StatusCode -eq 200 -and $r.Content -match 'Steam2 Archive') { $ok = $true; break }
+            } catch { }
+          }
+          Stop-Process -Id $exe.Id -Force -ErrorAction SilentlyContinue
+          if (-not $ok) { throw 'the published exe did not serve its UI' }
+          Write-Host 'served the UI'
+
+      - name: Package
+        shell: pwsh
+        run: |
+          Copy-Item README.md publish/
+          Compress-Archive -Path publish/* -DestinationPath steam2browser-win-x64.zip -Force
+          Get-Item steam2browser-win-x64.zip | Select-Object Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: steam2browser-win-x64
+          path: steam2browser-win-x64.zip
+
+      - name: Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # The app checks for updates by comparing its build stamp against the newest commit
+        # time on main, so every push to main gets a build that carries that commit's date.
+        run: |
+          $tag = "v1.0.${{ github.run_number }}"
+          $sha = "${{ github.sha }}".Substring(0,7)
+          $notes = @"
+          Built from commit $sha.
+
+          Download ``steam2browser-win-x64.zip``, unzip, run ``steam2browser.exe``.
+          Self-contained: no .NET install needed. Everything it writes goes to ``steam2info/``
+          next to the executable.
+          "@
+          gh release create $tag steam2browser-win-x64.zip `
+            --title $tag `
+            --notes $notes `
+            --target ${{ github.sha }}

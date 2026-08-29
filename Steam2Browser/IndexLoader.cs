@@ -22,13 +22,37 @@ public sealed class IndexLoader(ArchiveClient client, Settings settings)
     private const string DatsDates = "dats_dates.txt";
     private const string BlobsDates = "blobs_dates.txt";
     private const string SizeCache = "sizes.bin";
+    private const string CompactFile = "index.bin";
     private const int SizeCacheMagic = 0x32534253; // "SBS2"
 
-    public async Task LoadAsync(bool refreshIndex, bool withSizes, CancellationToken ct = default)
+    public async Task LoadAsync(bool refreshIndex, bool withSizes, bool ignoreEmbedded = false, CancellationToken ct = default)
     {
         try
         {
             Directory.CreateDirectory(settings.IndexDir);
+
+            // Order of preference: a refreshed compact index on disk, then the one baked into this
+            // build, then the mirror. The baked-in copy is what keeps a first run off the network —
+            // otherwise it is 13 MB of *_dates.txt plus ~40 MB of directory listings for the sizes.
+            if (!refreshIndex && !ignoreEmbedded)
+            {
+                var snapshot = CompactIndex.FromFile(Path.Combine(settings.IndexDir, CompactFile))
+                               ?? CompactIndex.FromEmbedded();
+
+                if (snapshot is not null)
+                {
+                    Status.Phase = "parse";
+                    Status.Message = "reading the built-in index";
+                    Status.Percent = 50;
+
+                    var built = await Task.Run(() => CompactIndex.ToCatalog(snapshot), ct);
+                    Catalog = built;
+
+                    Status.Ready = true;
+                    Done(built, $"snapshot from {snapshot.GeneratedUtc:yyyy-MM-dd}");
+                    return;
+                }
+            }
 
             Status.Phase = "index";
             Status.Percent = 0;
@@ -104,6 +128,7 @@ public sealed class IndexLoader(ArchiveClient client, Settings settings)
 
             cat.ApplySizes(sizes);
             await Task.Run(() => WriteSizeCache(cachePath, sizes), ct);
+            SaveCompact(cat);
             Done(cat);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -118,11 +143,12 @@ public sealed class IndexLoader(ArchiveClient client, Settings settings)
         }
     }
 
-    private void Done(Catalog cat)
+    private void Done(Catalog cat, string? note = null)
     {
         Status.Phase = "ready";
         Status.Percent = 100;
-        Status.Message = $"{cat.Ordered.Count} depots · {Fmt(cat.ApproxTotalBytes)} total";
+        Status.Message = $"{cat.Ordered.Count} depots · {Fmt(cat.ApproxTotalBytes)} total"
+                         + (note is null ? "" : $" · {note}");
     }
 
     private static string Fmt(long b)
@@ -147,6 +173,27 @@ public sealed class IndexLoader(ArchiveClient client, Settings settings)
         }
     }
 
+    /// <summary>
+    /// Existing copies of an index file, searched next to the executable and the working directory
+    /// and then upwards through their parents.
+    /// </summary>
+    private static IEnumerable<string> NearbyCopies(string name)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var start in new[] { AppContext.BaseDirectory, Directory.GetCurrentDirectory() })
+        {
+            var dir = new DirectoryInfo(start);
+            for (int up = 0; up < 6 && dir is not null; up++, dir = dir.Parent)
+            {
+                string candidate = Path.Combine(dir.FullName, name);
+                if (!seen.Add(candidate)) continue;
+                if (File.Exists(candidate) && new FileInfo(candidate).Length > 0)
+                    yield return candidate;
+            }
+        }
+    }
+
     /// <summary>Uses a local copy of an index file when present, otherwise pulls it from the mirror.</summary>
     private async Task<string> EnsureAsync(string name, bool refresh, double from, double to, CancellationToken ct)
     {
@@ -159,19 +206,17 @@ public sealed class IndexLoader(ArchiveClient client, Settings settings)
             return target;
         }
 
-        // A copy sitting next to the executable or in the working directory saves a download.
+        // A copy already on disk saves a 7 MB download. Walk up from both the executable and the
+        // working directory, since a dev build sits several levels below the project root where
+        // these files usually live.
         if (!refresh)
         {
-            foreach (var dir in new[] { AppContext.BaseDirectory, Directory.GetCurrentDirectory() })
+            foreach (var candidate in NearbyCopies(name))
             {
-                string candidate = Path.Combine(dir, name);
-                if (File.Exists(candidate) && new FileInfo(candidate).Length > 0)
-                {
-                    File.Copy(candidate, target, overwrite: true);
-                    Status.Message = $"{name} (local copy)";
-                    Status.Percent = to;
-                    return target;
-                }
+                File.Copy(candidate, target, overwrite: true);
+                Status.Message = $"{name} (local copy)";
+                Status.Percent = to;
+                return target;
             }
         }
 
@@ -183,6 +228,24 @@ public sealed class IndexLoader(ArchiveClient client, Settings settings)
 
         Status.Percent = to;
         return target;
+    }
+
+    /// <summary>
+    /// Persists the freshly built catalog in the compact format, so later starts skip the network
+    /// entirely and a maintainer can embed the result in the next release.
+    /// </summary>
+    private void SaveCompact(Catalog cat)
+    {
+        try
+        {
+            var dats = cat.Ordered.SelectMany(d => d.Dats);
+            var blobs = cat.Ordered.SelectMany(d => d.Blobs);
+            CompactIndex.Write(Path.Combine(settings.IndexDir, CompactFile), dats, blobs);
+        }
+        catch
+        {
+            // Only an optimisation; the text files remain the source of truth on disk.
+        }
     }
 
     private static void WriteSizeCache(string path, Dictionary<(Kind, int, int, uint), long> sizes)

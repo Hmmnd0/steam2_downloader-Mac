@@ -54,7 +54,7 @@ public sealed class DownloadManager(ArchiveClient client, Settings settings)
     private readonly ConcurrentDictionary<string, DownloadJob> _jobs = new();
     private int _seq;
 
-    public IReadOnlyCollection<DownloadJob> Jobs => _jobs.Values;
+    public IReadOnlyCollection<DownloadJob> Jobs => _jobs.Values.ToArray();
 
     public DownloadJob? Get(string id) => _jobs.GetValueOrDefault(id);
 

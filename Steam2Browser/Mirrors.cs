@@ -44,6 +44,15 @@ public static class Mirrors
 
     private const int ProbeBytes = 4 * 1024 * 1024;
 
+    /// <summary>
+    /// The probe stops at whichever comes first, the byte cap or this. Without it a mirror running at
+    /// 45 KiB/s would hold the whole race — and everything queued behind it — for over a minute.
+    /// </summary>
+    private static readonly TimeSpan ProbeWindow = TimeSpan.FromSeconds(6);
+
+    /// <summary>Absolute cap on one probe, connect and read together, so a stalled mirror cannot hang the race.</summary>
+    private static readonly TimeSpan ProbeDeadline = TimeSpan.FromSeconds(12);
+
     /// <summary>Times a fixed-size ranged read from every mirror, in parallel.</summary>
     public static async Task TestAllAsync(HttpClient http, CancellationToken ct = default)
     {
@@ -53,21 +62,33 @@ public static class Mirrors
     public static async Task TestAsync(HttpClient http, Mirror m, CancellationToken ct = default)
     {
         var sw = Stopwatch.StartNew();
+        long total = 0;
+
+        // A hard deadline on the whole probe. The shared HttpClient has no timeout, and checking the
+        // window between reads does nothing if a read itself never returns — which is exactly how a
+        // stalled mirror used to hang the startup sequence that waits on this race.
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        deadline.CancelAfter(ProbeDeadline);
+        var probeCt = deadline.Token;
+
         try
         {
             using var req = new HttpRequestMessage(HttpMethod.Get, m.Url(ProbePath));
             req.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(0, ProbeBytes - 1);
 
-            using var resp = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+            using var resp = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, probeCt);
             resp.EnsureSuccessStatusCode();
 
             m.TtfbMs = sw.Elapsed.TotalMilliseconds;
 
-            await using var stream = await resp.Content.ReadAsStreamAsync(ct);
+            await using var stream = await resp.Content.ReadAsStreamAsync(probeCt);
             var buf = new byte[128 * 1024];
-            long total = 0;
             int read;
-            while ((read = await stream.ReadAsync(buf, ct)) > 0) total += read;
+            while ((read = await stream.ReadAsync(buf, probeCt)) > 0)
+            {
+                total += read;
+                if (sw.Elapsed >= ProbeWindow) break;
+            }
 
             sw.Stop();
             m.SpeedBps = sw.Elapsed.TotalSeconds > 0 ? total / sw.Elapsed.TotalSeconds : 0;
@@ -77,6 +98,14 @@ public static class Mirrors
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
             throw;
+        }
+        catch (OperationCanceledException)
+        {
+            // Hit the deadline. Whatever arrived still measures the mirror; nothing at all means unusable.
+            sw.Stop();
+            m.SpeedBps = total > 0 && sw.Elapsed.TotalSeconds > 0 ? total / sw.Elapsed.TotalSeconds : -1;
+            m.Reachable = total > 0;
+            m.Error = total > 0 ? null : $"no data within {ProbeDeadline.TotalSeconds:0}s";
         }
         catch (Exception ex)
         {

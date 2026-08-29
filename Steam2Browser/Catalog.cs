@@ -257,6 +257,25 @@ public sealed class Catalog
         return d;
     }
 
+    /// <summary>Adds up per-depot totals from sizes the entries already carry.</summary>
+    public void RecomputeTotals()
+    {
+        ApproxTotalBytes = 0;
+
+        foreach (var d in Depots.Values)
+        {
+            d.ApproxDatBytes = 0;
+            d.ApproxBlobBytes = 0;
+
+            foreach (var e in d.Dats)
+                if (e.ApproxSize > 0) d.ApproxDatBytes += e.ApproxSize;
+            foreach (var e in d.Blobs)
+                if (e.ApproxSize > 0) d.ApproxBlobBytes += e.ApproxSize;
+
+            ApproxTotalBytes += d.ApproxDatBytes + d.ApproxBlobBytes;
+        }
+    }
+
     /// <summary>Folds listing sizes into the built entries and recomputes per-depot totals.</summary>
     public void ApplySizes(Dictionary<(Kind, int, int, uint), long> sizes)
     {

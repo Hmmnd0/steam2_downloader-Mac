@@ -1,5 +1,4 @@
 using System.Collections.Concurrent;
-using System.Diagnostics;
 
 namespace Steam2Browser;
 
@@ -9,71 +8,40 @@ public sealed class ExtractRun
     public int Depot;
     public int Version;
     public string? BlobCrc;
-    public string CommandLine = "";
+    public string OutDir = "";
     public string Status = "running"; // running | done | failed | cancelled
-    public int? ExitCode;
     public string? Error;
     public DateTime StartedUtc = DateTime.UtcNow;
     public DateTime? FinishedUtc;
+
+    public readonly ExtractProgress Progress = new();
     public readonly ConcurrentQueue<string> Log = new();
 
-    internal Process? Proc;
+    internal CancellationTokenSource Cts = new();
 
     public void Say(string line)
     {
-        Log.Enqueue(line);
+        Log.Enqueue($"{DateTime.Now:HH:mm:ss}  {line}");
         while (Log.Count > 2000) Log.TryDequeue(out _);
     }
 }
 
 /// <summary>
-/// Drives the bundled extract.exe. Its CLI, from the published source:
-///   extract &lt;blob_path&gt; &lt;dat_path&gt; &lt;depot&gt; &lt;version&gt; [--blobcrc X] [--filter re] [--key K] [--out dir]
+/// Runs extraction in-process through <see cref="Steam2Extractor"/>. Nothing external is needed —
+/// the depot keys, blob, manifest and chunk formats are all ported, so there is no extract.exe to
+/// download and none of its path handling to work around.
 /// </summary>
-public sealed class ExtractorRunner(ArchiveClient client, Settings settings)
+public sealed class ExtractorRunner(Settings settings)
 {
     private readonly ConcurrentDictionary<string, ExtractRun> _runs = new();
     private int _seq;
 
-    public IReadOnlyCollection<ExtractRun> Runs => _runs.Values;
+    public IReadOnlyCollection<ExtractRun> Runs => _runs.Values.ToArray();
     public ExtractRun? Get(string id) => _runs.GetValueOrDefault(id);
 
-    /// <summary>Path to extract.exe, downloading it from the mirror the first time if needed.</summary>
-    public async Task<string> EnsureExeAsync(CancellationToken ct = default)
+    public ExtractRun Start(int depot, int version, string? blobCrc, string? filter, string? keyHex)
     {
-        if (!string.IsNullOrWhiteSpace(settings.ExtractExePath) && File.Exists(settings.ExtractExePath))
-            return settings.ExtractExePath;
-
-        string target = Path.Combine(settings.IndexDir, "extract.exe");
-        if (File.Exists(target) && new FileInfo(target).Length > 0)
-        {
-            settings.ExtractExePath = target;
-            settings.Save();
-            return target;
-        }
-
-        Directory.CreateDirectory(settings.IndexDir);
-        byte[] data = await client.GetBytesAsync("extractor/extract.exe", ct);
-        await File.WriteAllBytesAsync(target, data, ct);
-
-        settings.ExtractExePath = target;
-        settings.Save();
-        return target;
-    }
-
-    public async Task<ExtractRun> StartAsync(int depot, int version, string? blobCrc, string? filter, CancellationToken ct = default)
-    {
-        string exe = await EnsureExeAsync(ct);
-
-        string blobDir = Path.Combine(settings.DataDir, "blobs");
-        string datDir = Path.Combine(settings.DataDir, "dats");
         string outDir = Path.Combine(settings.ExtractOutDir, $"{depot}_{version}");
-        Directory.CreateDirectory(outDir);
-
-        var args = new List<string> { blobDir, datDir, depot.ToString(), version.ToString() };
-        if (!string.IsNullOrWhiteSpace(blobCrc)) { args.Add("--blobcrc"); args.Add(blobCrc.Trim()); }
-        if (!string.IsNullOrWhiteSpace(filter)) { args.Add("--filter"); args.Add(filter.Trim()); }
-        args.Add("--out"); args.Add(outDir);
 
         var run = new ExtractRun
         {
@@ -81,73 +49,55 @@ public sealed class ExtractorRunner(ArchiveClient client, Settings settings)
             Depot = depot,
             Version = version,
             BlobCrc = blobCrc,
-            CommandLine = Quote(exe) + " " + string.Join(' ', args.Select(Quote)),
+            OutDir = outDir,
         };
         _runs[run.Id] = run;
 
-        var psi = new ProcessStartInfo(exe)
+        run.Say($"depot {depot} version {version}{(blobCrc is null ? "" : $" crc {blobCrc}")}");
+        run.Say($"output: {outDir}");
+
+        _ = Task.Run(() =>
         {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            WorkingDirectory = settings.DataDir,
-        };
-        foreach (var a in args) psi.ArgumentList.Add(a);
-
-        run.Say(run.CommandLine);
-        run.Say($"output directory: {outDir}");
-        run.Say("--");
-
-        try
-        {
-            var proc = new Process { StartInfo = psi, EnableRaisingEvents = true };
-            proc.OutputDataReceived += (_, e) => { if (e.Data is not null) run.Say(e.Data); };
-            proc.ErrorDataReceived += (_, e) => { if (e.Data is not null) run.Say(e.Data); };
-
-            proc.Start();
-            run.Proc = proc;
-            proc.BeginOutputReadLine();
-            proc.BeginErrorReadLine();
-
-            _ = Task.Run(async () =>
+            try
             {
-                try
-                {
-                    await proc.WaitForExitAsync();
-                    run.ExitCode = proc.ExitCode;
-                    run.Status = proc.ExitCode == 0 ? "done" : "failed";
-                    if (proc.ExitCode != 0) run.Error = $"exit code {proc.ExitCode}";
-                }
-                catch (Exception ex)
-                {
-                    run.Status = "failed";
-                    run.Error = ex.Message;
-                }
-                finally
-                {
-                    run.FinishedUtc = DateTime.UtcNow;
-                }
-            });
-        }
-        catch (Exception ex)
-        {
-            run.Status = "failed";
-            run.Error = ex.Message;
-            run.FinishedUtc = DateTime.UtcNow;
-            run.Say($"could not start: {ex.Message}");
-        }
+                Directory.CreateDirectory(outDir);
+
+                var key = DepotKeys.ParseHex(keyHex);
+                if (keyHex is { Length: > 0 } && key is null)
+                    throw new InvalidDataException("the supplied key is not 32 hex characters");
+
+                Steam2Extractor.Extract(
+                    settings.DataDir, depot, version, blobCrc, filter, outDir,
+                    key, run.Progress, run.Say, run.Cts.Token);
+
+                run.Status = run.Progress.FailedFiles > 0 ? "failed" : "done";
+                if (run.Progress.FailedFiles > 0)
+                    run.Error = $"{run.Progress.FailedFiles} file(s) failed";
+            }
+            catch (OperationCanceledException)
+            {
+                run.Status = "cancelled";
+                run.Say("cancelled");
+            }
+            catch (Exception ex)
+            {
+                run.Status = "failed";
+                run.Error = ex.Message;
+                run.Say($"failed: {ex.Message}");
+            }
+            finally
+            {
+                run.FinishedUtc = DateTime.UtcNow;
+                run.Progress.Current = "";
+            }
+        });
 
         return run;
     }
 
     public void Cancel(string id)
     {
-        if (_runs.TryGetValue(id, out var run) && run.Proc is { HasExited: false } p)
-        {
-            try { p.Kill(entireProcessTree: true); run.Status = "cancelled"; }
-            catch { /* already gone */ }
-        }
+        if (_runs.TryGetValue(id, out var run)) run.Cts.Cancel();
     }
 
     public void Clear()
@@ -156,6 +106,4 @@ public sealed class ExtractorRunner(ArchiveClient client, Settings settings)
             if (kv.Value.Status is "done" or "failed" or "cancelled")
                 _runs.TryRemove(kv.Key, out _);
     }
-
-    private static string Quote(string s) => s.Contains(' ') ? $"\"{s}\"" : s;
 }

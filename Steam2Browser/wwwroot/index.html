@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Steam2 Archive Browser</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="mark"></span>
+    <div>
+      <h1>Steam2 Archive</h1>
+      <p id="loadStatus">starting…</p>
+    </div>
+  </div>
+
+  <div class="stats" id="stats"></div>
+
+  <div class="mirror">
+    <label>Mirror</label>
+    <select id="mirrorSelect"></select>
+    <button id="testMirrors" class="ghost" title="Download 4 MiB from each mirror and compare">Test speed</button>
+  </div>
+
+  <button id="openSettings" class="ghost icon" title="Settings">⚙</button>
+</header>
+
+<div id="loadBar"><i></i></div>
+
+<main class="layout">
+
+  <aside class="depots">
+    <div class="toolbar">
+      <input id="depotSearch" type="search" placeholder="Depot id…" autocomplete="off">
+      <select id="depotSort">
+        <option value="id">Depot id</option>
+        <option value="size">Total size</option>
+        <option value="versions">Versions</option>
+        <option value="date">Newest</option>
+        <option value="files">File count</option>
+      </select>
+      <button id="depotDir" class="ghost icon" title="Reverse order">↑</button>
+    </div>
+
+    <div class="chips" id="depotFilters">
+      <button data-filter="" class="on">All</button>
+      <button data-filter="reset">Resets</button>
+      <button data-filter="incomplete">Incomplete</button>
+      <button data-filter="big">≥1 GiB</button>
+      <button data-filter="single">Single version</button>
+    </div>
+
+    <div class="listhead"><span id="depotCount"></span></div>
+    <div class="depot-list" id="depotList"></div>
+  </aside>
+
+  <section class="detail" id="detail">
+    <div class="empty">
+      <h2>Pick a depot</h2>
+      <p>Files are stored as deltas: extracting version <em>N</em> needs every version below it too.
+         Where a depot was reset the same version number exists twice and the chain forks — the
+         planner follows the parent links recorded inside each blob to work out which files are
+         actually needed.</p>
+    </div>
+  </section>
+
+</main>
+
+<footer class="activity" id="activity">
+  <div class="acttabs">
+    <button data-tab="downloads" class="on">Downloads <b id="dlBadge"></b></button>
+    <button data-tab="extract">Extract <b id="exBadge"></b></button>
+    <button id="actToggle" class="ghost icon right" title="Collapse">▾</button>
+  </div>
+  <div class="actbody">
+    <div id="tab-downloads" class="tabpane on"></div>
+    <div id="tab-extract" class="tabpane"></div>
+  </div>
+</footer>
+
+<dialog id="settingsDlg">
+  <form method="dialog">
+    <h2>Settings</h2>
+
+    <label>Download directory
+      <span class="hint">blobs and dats go into subfolders here, the layout extract.exe wants</span>
+      <input id="setDataDir" type="text">
+    </label>
+
+    <label>extract.exe
+      <span class="hint">leave empty to download it from the mirror on first use</span>
+      <input id="setExtractExe" type="text">
+    </label>
+
+    <label>Extract output directory
+      <input id="setExtractOut" type="text">
+    </label>
+
+    <label>Parallel downloads
+      <input id="setConcurrency" type="number" min="1" max="64">
+    </label>
+
+    <label class="row">
+      <input id="setVerify" type="checkbox">
+      <span>Verify sha256 after download
+        <span class="hint">the hash is the 4th part of every file name</span></span>
+    </label>
+
+    <label class="row">
+      <input id="setFailover" type="checkbox">
+      <span>Retry on another mirror when one fails
+        <span class="hint">all three serve byte-identical files</span></span>
+    </label>
+
+    <div class="dlgrow">
+      <button id="reloadIndex" type="button" class="ghost">Re-download index</button>
+      <button id="reloadSizes" type="button" class="ghost">Refresh sizes</button>
+    </div>
+
+    <menu>
+      <button value="cancel" class="ghost">Close</button>
+      <button id="saveSettings" value="save" class="primary">Save</button>
+    </menu>
+  </form>
+</dialog>
+
+<script src="app.js"></script>
+</body>
+</html>

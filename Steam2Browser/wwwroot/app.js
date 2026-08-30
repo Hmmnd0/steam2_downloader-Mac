@@ -759,7 +759,10 @@ $('#openSettings').onclick = () => {
   $('#setExtractOut').value = s.extractOutDir ?? '';
   $('#setConcurrency').value = s.concurrency ?? 8;
   $('#setTorrentPort').value = s.torrentPort ?? 0;
-  $('#setSequential').checked = s.sequentialDownloads !== false;
+  $('#setPhased').checked = s.phasedDownloads !== false;
+  $('#setBlobStreams').value = s.blobConcurrency ?? 32;
+  $('#setDatStreams').value = s.datConcurrency ?? 2;
+  $('#setWarmAhead').value = s.warmupLookahead ?? 2;
   $('#setVerify').checked = !!s.verifyHashes;
   $('#setFailover').checked = !!s.failover;
   $('#settingsDlg').showModal();
@@ -770,7 +773,10 @@ $('#saveSettings').onclick = async () => {
     extractOutDir: $('#setExtractOut').value,
     concurrency: +$('#setConcurrency').value,
     torrentPort: +$('#setTorrentPort').value,
-    sequentialDownloads: $('#setSequential').checked,
+    phasedDownloads: $('#setPhased').checked,
+    blobConcurrency: +$('#setBlobStreams').value,
+    datConcurrency: +$('#setDatStreams').value,
+    warmupLookahead: +$('#setWarmAhead').value,
     verifyHashes: $('#setVerify').checked,
     failover: $('#setFailover').checked,
   });

@@ -33,6 +33,33 @@ public sealed class ArchiveClient(HttpClient http)
     /// </summary>
     public bool UseSegments { get; set; }
 
+    /// <summary>Cap on a warm-up touch. It must never hold anything up, so it gives up quickly.</summary>
+    private static readonly TimeSpan WarmTimeout = TimeSpan.FromSeconds(15);
+
+    /// <summary>
+    /// Asks the mirror for one byte of a file that will be wanted shortly, so the storage has it
+    /// open and cached by the time the real request arrives. Costs a byte plus headers, targets the
+    /// mirror actually in use (no failover), and swallows everything — nothing depends on it.
+    /// </summary>
+    public async Task WarmAsync(Entry entry, CancellationToken ct = default)
+    {
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(WarmTimeout);
+
+            using var req = new HttpRequestMessage(HttpMethod.Get, Primary.Url(entry.RelPath));
+            req.Headers.Range = new RangeHeaderValue(0, 0);
+
+            using var resp = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
+            await resp.Content.CopyToAsync(Stream.Null, timeout.Token);
+        }
+        catch
+        {
+            // Best effort. A failed warm-up is not a failed download.
+        }
+    }
+
     private IEnumerable<Mirror> Order()
     {
         yield return Primary;

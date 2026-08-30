@@ -120,18 +120,25 @@ public sealed class DownloadManager(ArchiveClient client, Settings settings, Tor
 
         try
         {
-            if (settings.SequentialDownloads)
+            if (settings.PhasedDownloads)
             {
-                // The mirrors hand a fresh connection a slow rate and only ramp it up while that
-                // one connection keeps asking. Parallel files, and ranged segments within a file,
-                // therefore all sit at the cold rate at once. One stream per phase warms up.
+                // Two phases, each with its own stream count. Blobs are kilobytes, so latency
+                // dominates and many at once is free. Dats are large and these mirrors speed a
+                // connection up the longer it keeps asking, so only a couple of streams are used —
+                // more of them, or one file split into ranges, all sit at the cold starting rate.
                 var blobs = ordered.Where(f => f.Entry.Kind == Kind.Blob).ToList();
                 var dats = ordered.Where(f => f.Entry.Kind == Kind.Dat).ToList();
 
-                job.Say($"single stream: {blobs.Count} blob(s) first, then {dats.Count} dat(s)");
+                int blobStreams = Math.Max(1, settings.BlobConcurrency);
+                int datStreams = Math.Max(1, settings.DatConcurrency);
 
-                await OnePhaseAsync(job, blobs, "blobs", ct);
-                await OnePhaseAsync(job, dats, "dats", ct);
+                job.Say($"phased: {blobs.Count} blob(s) at {blobStreams} stream(s), " +
+                        $"then {dats.Count} dat(s) at {datStreams} stream(s)");
+
+                // Only the dat phase warms ahead. Blobs are kilobytes and already run 32 at a
+                // time, so there is nothing to hide the latency of.
+                await OnePhaseAsync(job, blobs, "blobs", blobStreams, warmAhead: false, ct);
+                await OnePhaseAsync(job, dats, "dats", datStreams, warmAhead: true, ct);
             }
             else
             {
@@ -164,18 +171,43 @@ public sealed class DownloadManager(ArchiveClient client, Settings settings, Tor
         }
     }
 
-    /// <summary>Works through one kind of file strictly one at a time, keeping a single stream alive.</summary>
-    private async Task OnePhaseAsync(DownloadJob job, List<PlanFile> files, string what, CancellationToken ct)
+    /// <summary>Runs one kind of file to completion before the caller moves on to the next phase.</summary>
+    private async Task OnePhaseAsync(
+        DownloadJob job, List<PlanFile> files, string what, int streams, bool warmAhead, CancellationToken ct)
     {
         if (files.Count == 0) return;
 
-        job.Say($"{what}: {files.Count} file(s)");
+        int lookahead = warmAhead ? Math.Max(0, settings.WarmupLookahead) : 0;
 
-        foreach (var pf in files)
+        job.Say($"{what}: {files.Count} file(s), {streams} stream(s)"
+                + (lookahead > 0 ? $", warming {lookahead} ahead" : ""));
+
+        using var gate = new SemaphoreSlim(streams);
+
+        await Task.WhenAll(files.Select(async (pf, index) =>
         {
-            ct.ThrowIfCancellationRequested();
-            await OneFileAsync(job, pf, ct);
-        }
+            await gate.WaitAsync(ct);
+            try
+            {
+                if (lookahead > 0) WarmAhead(files, index + lookahead, ct);
+                await OneFileAsync(job, pf, ct);
+            }
+            finally { gate.Release(); }
+        }));
+    }
+
+    /// <summary>
+    /// Touches an upcoming file so the mirror can have it ready. Deliberately not awaited: the point
+    /// is only that the request reaches the mirror, and its outcome never affects this download.
+    /// </summary>
+    private void WarmAhead(List<PlanFile> files, int index, CancellationToken ct)
+    {
+        if (index < 0 || index >= files.Count) return;
+
+        var entry = files[index].Entry;
+        if (File.Exists(Path.Combine(settings.DataDir, entry.DirName, entry.FileName))) return;
+
+        _ = client.WarmAsync(entry, ct);
     }
 
     private static void Finish(DownloadJob job)

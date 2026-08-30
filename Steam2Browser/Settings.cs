@@ -17,12 +17,27 @@ public sealed class Settings
     public int Concurrency { get; set; } = 8;
 
     /// <summary>
-    /// Fetch one file at a time over a single connection, blobs first and then dats.
-    /// The mirrors serve a new connection slowly and only ramp up while one keeps asking, so many
-    /// parallel streams — or one file split into ranges — leave every stream stuck at the cold rate.
-    /// Turn off to use <see cref="Concurrency"/> parallel files and ranged segments instead.
+    /// Download in two phases — every blob first, then every dat — each with its own stream count.
+    /// Blobs are kilobytes, so many at once costs nothing; dats are large and the mirrors ramp a
+    /// connection up over time, so only a couple of sustained streams are used for them.
+    /// Turn off to fall back to <see cref="Concurrency"/> parallel files and ranged segments.
     /// </summary>
-    public bool SequentialDownloads { get; set; } = true;
+    public bool PhasedDownloads { get; set; } = true;
+
+    /// <summary>Streams used during the blob phase. They are tiny, so latency dominates.</summary>
+    public int BlobConcurrency { get; set; } = 32;
+
+    /// <summary>
+    /// Streams used during the dat phase. Kept low on purpose: these mirrors start a connection
+    /// slow and speed it up while it keeps asking, so many parallel streams all sit at the cold rate.
+    /// </summary>
+    public int DatConcurrency { get; set; } = 2;
+
+    /// <summary>
+    /// How many dats ahead to touch with a one-byte request when a download starts, so the mirror
+    /// has the next files ready. 0 disables it. Fire-and-forget, so it cannot slow anything down.
+    /// </summary>
+    public int WarmupLookahead { get; set; } = 2;
     public bool VerifyHashes { get; set; } = true;
     public int TorrentPort { get; set; }
 
@@ -82,6 +97,9 @@ public sealed class Settings
         if (string.IsNullOrWhiteSpace(s.IndexDir)) s.IndexDir = Path.Combine(root, "index");
         if (string.IsNullOrWhiteSpace(s.ExtractOutDir)) s.ExtractOutDir = Path.Combine(root, "extracted");
         if (s.Concurrency is < 1 or > 64) s.Concurrency = 8;
+        if (s.BlobConcurrency is < 1 or > 128) s.BlobConcurrency = 32;
+        if (s.DatConcurrency is < 1 or > 64) s.DatConcurrency = 2;
+        if (s.WarmupLookahead is < 0 or > 16) s.WarmupLookahead = 2;
         if (s.TorrentPort is < 0 or > 65535) s.TorrentPort = 0;
         return s;
     }

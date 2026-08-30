@@ -30,7 +30,7 @@ var client = new ArchiveClient(http)
 {
     Primary = Mirrors.ById(settings.MirrorId),
     Failover = settings.Failover,
-    UseSegments = !settings.SequentialDownloads,
+    UseSegments = !settings.PhasedDownloads,
 };
 var loader = new IndexLoader(client, settings);
 var torrent = new TorrentSource(settings);
@@ -140,7 +140,10 @@ app.MapGet("/api/state", () => new
         settings.MirrorId,
         settings.Failover,
         settings.Concurrency,
-        settings.SequentialDownloads,
+        settings.PhasedDownloads,
+        settings.BlobConcurrency,
+        settings.DatConcurrency,
+        settings.WarmupLookahead,
         settings.VerifyHashes,
         settings.TorrentPort,
         settings.ExtractOutDir,
@@ -221,11 +224,14 @@ app.MapPost("/api/settings", async (SettingsPatch patch) =>
     if (patch.MirrorId is { } mid) { settings.MirrorId = mid; client.Primary = Mirrors.ById(mid); }
     if (patch.Failover is { } fo) { settings.Failover = fo; client.Failover = fo; }
     if (patch.Concurrency is { } cc) settings.Concurrency = Math.Clamp(cc, 1, 64);
-    if (patch.SequentialDownloads is { } seq)
+    if (patch.PhasedDownloads is { } phased)
     {
-        settings.SequentialDownloads = seq;
-        client.UseSegments = !seq;
+        settings.PhasedDownloads = phased;
+        client.UseSegments = !phased;
     }
+    if (patch.BlobConcurrency is { } bc) settings.BlobConcurrency = Math.Clamp(bc, 1, 128);
+    if (patch.DatConcurrency is { } dc) settings.DatConcurrency = Math.Clamp(dc, 1, 64);
+    if (patch.WarmupLookahead is { } wl) settings.WarmupLookahead = Math.Clamp(wl, 0, 16);
     if (patch.VerifyHashes is { } vh) settings.VerifyHashes = vh;
     if (patch.TorrentPort is { } tp)
     {
@@ -545,7 +551,7 @@ return 0;
 // ---------------- request bodies ----------------
 
 internal sealed record SettingsPatch(
-    string? MirrorId, bool? Failover, int? Concurrency, bool? VerifyHashes, bool? SequentialDownloads,
+    string? MirrorId, bool? Failover, int? Concurrency, bool? VerifyHashes, bool? PhasedDownloads, int? BlobConcurrency, int? DatConcurrency, int? WarmupLookahead,
     int? TorrentPort, string? DataDir, string? ExtractOutDir, string[]? ExtraTrackers);
 
 internal sealed record ReloadRequest(bool Refresh, bool Sizes);

@@ -109,11 +109,23 @@
     </label>
 
     <label class="row">
-      <input id="setSequential" type="checkbox">
-      <span>One file at a time, single connection
-        <span class="hint">blobs first, then dats. The mirrors ramp a connection up over time, so
-        parallel files and split ranges all stay stuck at the slow starting rate</span></span>
+      <input id="setPhased" type="checkbox">
+      <span>Phased download: all blobs, then all dats
+        <span class="hint">the mirrors speed a connection up the longer it keeps asking, so dats use
+        only a couple of sustained streams and are never split into ranges</span></span>
     </label>
+
+    <div class="dlgrow">
+      <label style="flex:1">Blob streams
+        <input id="setBlobStreams" type="number" min="1" max="128">
+      </label>
+      <label style="flex:1">Dat streams
+        <input id="setDatStreams" type="number" min="1" max="64">
+      </label>
+      <label style="flex:1">Warm ahead
+        <input id="setWarmAhead" type="number" min="0" max="16">
+      </label>
+    </div>
 
     <label class="row">
       <input id="setVerify" type="checkbox">

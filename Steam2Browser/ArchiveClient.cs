@@ -10,9 +10,17 @@ namespace Steam2Browser;
 /// </summary>
 public sealed class ArchiveClient(HttpClient http)
 {
-    private const long SegmentedThresholdBytes = 32L * 1024 * 1024;
-    private const int SegmentSizeBytes = 16 * 1024 * 1024;
-    private const int SegmentsPerFile = 4;
+    private const long SegmentedThresholdBytes = 1L * 1024 * 1024;
+    private const int MinSegmentSizeBytes = 1 * 1024 * 1024;
+    private const int MaxSegmentSizeBytes = 8 * 1024 * 1024;
+    private const int SegmentsPerFile = 32;
+    private const int MaxConcurrentTransfers = 32;
+    private const int MaxRangeFailuresWithoutProgress = 6;
+    private static readonly TimeSpan ReadInactivityTimeout = TimeSpan.FromSeconds(20);
+
+    // DownloadManager limits files, while this gate limits the actual HTTP streams. Without it,
+    // several files with many ranges each can overload the mirror and leave every stream starved.
+    private readonly SemaphoreSlim transferGate = new(MaxConcurrentTransfers, MaxConcurrentTransfers);
 
     public Mirror Primary { get; set; } = Mirrors.All[0];
 
@@ -98,7 +106,37 @@ public sealed class ArchiveClient(HttpClient http)
         }
 
         string partPath = destPath + ".part";
+        string segmentedMarkerPath = partPath + ".segmented";
+
+        // Segmented downloads preallocate the target, so its file length is not resume progress.
+        // A marker left by a killed process means the file must be restarted instead of issuing a
+        // bogus Range request from EOF.
+        if (File.Exists(segmentedMarkerPath))
+        {
+            TryDelete(partPath);
+            TryDelete(segmentedMarkerPath);
+        }
+
         long resumeFrom = File.Exists(partPath) ? new FileInfo(partPath).Length : 0;
+
+        // Builds before the marker was introduced can leave a partially-filled, full-size .part.
+        // Recover a genuinely complete file, otherwise discard it so the ranged path can run.
+        if (resumeFrom > 0 && entry.Kind == Kind.Dat)
+        {
+            long remoteLength = await GetLengthAsync(entry.RelPath, ct);
+            if (remoteLength > 0 && resumeFrom >= remoteLength)
+            {
+                if (resumeFrom == remoteLength && await VerifyAsync(partPath, entry.Sha, ct))
+                {
+                    File.Move(partPath, destPath, overwrite: true);
+                    onProgress?.Invoke(remoteLength, remoteLength);
+                    return 0;
+                }
+
+                TryDelete(partPath);
+                resumeFrom = 0;
+            }
+        }
 
         Exception? last = null;
         foreach (var m in Order())
@@ -132,72 +170,89 @@ public sealed class ArchiveClient(HttpClient http)
         Mirror mirror, Entry entry, string partPath, long resumeFrom,
         Action<long, long>? onProgress, CancellationToken ct)
     {
-        if (resumeFrom == 0 && entry.Kind == Kind.Dat && (entry.ApproxSize < 0 || entry.ApproxSize >= SegmentedThresholdBytes))
+        if (entry.Kind == Kind.Dat && (entry.ApproxSize < 0 || entry.ApproxSize >= SegmentedThresholdBytes))
         {
-            var segmented = await TryPullSegmentedAsync(mirror, entry, partPath, onProgress, ct);
+            var segmented = await TryPullSegmentedAsync(mirror, entry, partPath, resumeFrom, onProgress, ct);
             if (segmented is not null) return segmented.Value;
         }
 
         using var req = new HttpRequestMessage(HttpMethod.Get, mirror.Url(entry.RelPath));
         if (resumeFrom > 0) req.Headers.Range = new RangeHeaderValue(resumeFrom, null);
 
-        using var resp = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
-
-        // Server ignored the Range header, so start over from zero.
-        if (resumeFrom > 0 && resp.StatusCode != HttpStatusCode.PartialContent)
+        await transferGate.WaitAsync(ct);
+        try
         {
-            resumeFrom = 0;
-            if (File.Exists(partPath)) File.Delete(partPath);
+            using var resp = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+
+            // Server ignored the Range header, so start over from zero.
+            if (resumeFrom > 0 && resp.StatusCode != HttpStatusCode.PartialContent)
+            {
+                resumeFrom = 0;
+                if (File.Exists(partPath)) File.Delete(partPath);
+            }
+            resp.EnsureSuccessStatusCode();
+
+            long total = (resp.Content.Headers.ContentLength ?? -1) + (resumeFrom > 0 ? resumeFrom : 0);
+
+            await using var netStream = await resp.Content.ReadAsStreamAsync(ct);
+            await using var file = new FileStream(
+                partPath, resumeFrom > 0 ? FileMode.Append : FileMode.Create,
+                FileAccess.Write, FileShare.None, 1 << 20, useAsync: true);
+
+            var buffer = new byte[1 << 20];
+            long done = resumeFrom;
+            long pulled = 0;
+            int read;
+
+            while ((read = await ReadWithInactivityTimeoutAsync(netStream, buffer, ct)) > 0)
+            {
+                await file.WriteAsync(buffer.AsMemory(0, read), ct);
+                done += read;
+                pulled += read;
+                onProgress?.Invoke(done, total);
+            }
+
+            return pulled;
         }
-        resp.EnsureSuccessStatusCode();
-
-        long total = (resp.Content.Headers.ContentLength ?? -1) + (resumeFrom > 0 ? resumeFrom : 0);
-
-        await using var netStream = await resp.Content.ReadAsStreamAsync(ct);
-        await using var file = new FileStream(
-            partPath, resumeFrom > 0 ? FileMode.Append : FileMode.Create,
-            FileAccess.Write, FileShare.None, 1 << 20, useAsync: true);
-
-        var buffer = new byte[1 << 20];
-        long done = resumeFrom;
-        long pulled = 0;
-        int read;
-
-        while ((read = await netStream.ReadAsync(buffer, ct)) > 0)
+        finally
         {
-            await file.WriteAsync(buffer.AsMemory(0, read), ct);
-            done += read;
-            pulled += read;
-            onProgress?.Invoke(done, total);
+            transferGate.Release();
         }
-
-        return pulled;
     }
 
     private async Task<long?> TryPullSegmentedAsync(
-        Mirror mirror, Entry entry, string partPath,
+        Mirror mirror, Entry entry, string partPath, long resumeFrom,
         Action<long, long>? onProgress, CancellationToken ct)
     {
         long length = await GetMirrorLengthAsync(mirror, entry.RelPath, ct);
         if (length < SegmentedThresholdBytes) return null;
 
         Directory.CreateDirectory(Path.GetDirectoryName(partPath)!);
+        string markerPath = partPath + ".segmented";
 
         try
         {
-            await using (var fs = new FileStream(partPath, FileMode.Create, FileAccess.Write, FileShare.ReadWrite, 1, useAsync: true))
+            await File.WriteAllTextAsync(markerPath, length.ToString(), ct);
+            await using (var fs = new FileStream(
+                partPath, resumeFrom > 0 ? FileMode.Open : FileMode.Create,
+                FileAccess.Write, FileShare.ReadWrite, 1, useAsync: true))
                 fs.SetLength(length);
 
             var ranges = new Queue<(int Index, long From, long To)>();
             int index = 0;
-            for (long from = 0; from < length; from += SegmentSizeBytes)
-                ranges.Enqueue((index++, from, Math.Min(length - 1, from + SegmentSizeBytes - 1)));
+            long segmentSize = Math.Clamp(
+                (length + SegmentsPerFile - 1) / SegmentsPerFile,
+                MinSegmentSizeBytes,
+                MaxSegmentSizeBytes);
+            for (long from = resumeFrom; from < length; from += segmentSize)
+                ranges.Enqueue((index++, from, Math.Min(length - 1, from + segmentSize - 1)));
 
             var segmentProgress = new long[index];
             var progressLock = new object();
-            long done = 0;
+            long done = resumeFrom;
+            onProgress?.Invoke(done, length);
 
-            var workers = Enumerable.Range(0, SegmentsPerFile).Select(async _ =>
+            var workers = Enumerable.Range(0, Math.Min(SegmentsPerFile, index)).Select(async _ =>
             {
                 while (true)
                 {
@@ -224,12 +279,14 @@ public sealed class ArchiveClient(HttpClient http)
             });
 
             await Task.WhenAll(workers);
+            TryDelete(markerPath);
             onProgress?.Invoke(length, length);
-            return length;
+            return length - resumeFrom;
         }
         catch
         {
-            try { if (File.Exists(partPath)) File.Delete(partPath); } catch { /* next mirror or caller handles the real error */ }
+            TryDelete(partPath);
+            TryDelete(markerPath);
             throw;
         }
     }
@@ -247,34 +304,94 @@ public sealed class ArchiveClient(HttpClient http)
         Mirror mirror, Entry entry, string partPath, long from, long to,
         Action<long> onSegmentProgress, CancellationToken ct)
     {
-        using var req = new HttpRequestMessage(HttpMethod.Get, mirror.Url(entry.RelPath));
-        req.Headers.Range = new RangeHeaderValue(from, to);
-
-        using var resp = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
-        if (resp.StatusCode != HttpStatusCode.PartialContent)
-            throw new HttpRequestException($"range request was not honored by {mirror.Id}");
-        resp.EnsureSuccessStatusCode();
-
-        await using var netStream = await resp.Content.ReadAsStreamAsync(ct);
-        await using var file = new FileStream(
-            partPath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite,
-            1 << 20, useAsync: true);
-        file.Seek(from, SeekOrigin.Begin);
-
         var buffer = new byte[1 << 20];
-        long remaining = to - from + 1;
         long done = 0;
+        int failuresWithoutProgress = 0;
 
-        while (remaining > 0)
+        while (from + done <= to)
         {
-            int read = await netStream.ReadAsync(buffer.AsMemory(0, (int)Math.Min(buffer.Length, remaining)), ct);
-            if (read == 0) throw new EndOfStreamException($"range {from}-{to} ended early");
+            long attemptStart = done;
+            try
+            {
+                await transferGate.WaitAsync(ct);
+                try
+                {
+                    long requestFrom = from + done;
+                    using var req = new HttpRequestMessage(HttpMethod.Get, mirror.Url(entry.RelPath))
+                    {
+                        // Independent HTTP/1.1 connections are intentional here. HTTP/2 would
+                        // multiplex ranges over fewer TCP connections and lose the measured gain.
+                        Version = HttpVersion.Version11,
+                        VersionPolicy = HttpVersionPolicy.RequestVersionExact,
+                    };
+                    req.Headers.Range = new RangeHeaderValue(requestFrom, to);
 
-            await file.WriteAsync(buffer.AsMemory(0, read), ct);
-            remaining -= read;
-            done += read;
-            onSegmentProgress(done);
+                    using var resp = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+                    if (resp.StatusCode != HttpStatusCode.PartialContent)
+                        throw new HttpRequestException($"range request was not honored by {mirror.Id}");
+                    resp.EnsureSuccessStatusCode();
+
+                    long? returnedFrom = resp.Content.Headers.ContentRange?.From;
+                    if (returnedFrom != requestFrom)
+                        throw new InvalidDataException($"range response started at {returnedFrom}, expected {requestFrom}");
+
+                    await using var netStream = await resp.Content.ReadAsStreamAsync(ct);
+                    await using var file = new FileStream(
+                        partPath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite,
+                        1 << 20, useAsync: true);
+                    file.Seek(requestFrom, SeekOrigin.Begin);
+
+                    while (from + done <= to)
+                    {
+                        int wanted = (int)Math.Min(buffer.Length, to - (from + done) + 1);
+                        int read = await ReadWithInactivityTimeoutAsync(netStream, buffer.AsMemory(0, wanted), ct);
+                        if (read == 0) throw new EndOfStreamException($"range {requestFrom}-{to} ended early");
+
+                        await file.WriteAsync(buffer.AsMemory(0, read), ct);
+                        done += read;
+                        onSegmentProgress(done);
+                    }
+                }
+                finally
+                {
+                    transferGate.Release();
+                }
+
+                return;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception) when (failuresWithoutProgress < MaxRangeFailuresWithoutProgress)
+            {
+                failuresWithoutProgress = done > attemptStart ? 0 : failuresWithoutProgress + 1;
+                if (failuresWithoutProgress >= MaxRangeFailuresWithoutProgress) throw;
+
+                await Task.Delay(TimeSpan.FromMilliseconds(250 * failuresWithoutProgress), ct);
+            }
         }
+    }
+
+    private static async ValueTask<int> ReadWithInactivityTimeoutAsync(
+        Stream stream, Memory<byte> buffer, CancellationToken ct)
+    {
+        using var inactivity = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        inactivity.CancelAfter(ReadInactivityTimeout);
+        try
+        {
+            return await stream.ReadAsync(buffer, inactivity.Token);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            throw new TimeoutException($"no download data received for {ReadInactivityTimeout.TotalSeconds:0} seconds");
+        }
+    }
+
+    private static void TryDelete(string path)
+    {
+        try { File.Delete(path); }
+        catch { /* Preserve the original network or verification error. */ }
     }
 
     public static async Task<bool> VerifyAsync(string path, string expectedSha, CancellationToken ct = default)

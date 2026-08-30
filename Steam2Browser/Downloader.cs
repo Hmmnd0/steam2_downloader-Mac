@@ -227,7 +227,12 @@ public sealed class DownloadManager(ArchiveClient client, Settings settings, Tor
 
             await client.DownloadFileAsync(entry, dest, settings.VerifyHashes, (done, total) =>
             {
-                if (total > 0) fp.Total = total;
+                if (total > 0)
+                {
+                    long previousTotal = Interlocked.Exchange(ref fp.Total, total);
+                    if (previousTotal != total)
+                        Interlocked.Add(ref job.TotalBytes, total - previousTotal);
+                }
                 fp.Done = done;
 
                 long delta = done - counted;

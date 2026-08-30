@@ -16,6 +16,7 @@ public sealed class Settings
 
     public int Concurrency { get; set; } = 8;
     public bool VerifyHashes { get; set; } = true;
+    public int TorrentPort { get; set; }
 
     public string ExtractOutDir { get; set; } = "";
 
@@ -73,6 +74,7 @@ public sealed class Settings
         if (string.IsNullOrWhiteSpace(s.IndexDir)) s.IndexDir = Path.Combine(root, "index");
         if (string.IsNullOrWhiteSpace(s.ExtractOutDir)) s.ExtractOutDir = Path.Combine(root, "extracted");
         if (s.Concurrency is < 1 or > 64) s.Concurrency = 8;
+        if (s.TorrentPort is < 0 or > 65535) s.TorrentPort = 0;
         return s;
     }
 

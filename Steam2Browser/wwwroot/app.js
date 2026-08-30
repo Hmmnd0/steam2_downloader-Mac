@@ -758,6 +758,7 @@ $('#openSettings').onclick = () => {
   $('#setDataDir').value = s.dataDir ?? '';
   $('#setExtractOut').value = s.extractOutDir ?? '';
   $('#setConcurrency').value = s.concurrency ?? 8;
+  $('#setTorrentPort').value = s.torrentPort ?? 0;
   $('#setVerify').checked = !!s.verifyHashes;
   $('#setFailover').checked = !!s.failover;
   $('#settingsDlg').showModal();
@@ -767,6 +768,7 @@ $('#saveSettings').onclick = async () => {
     dataDir: $('#setDataDir').value,
     extractOutDir: $('#setExtractOut').value,
     concurrency: +$('#setConcurrency').value,
+    torrentPort: +$('#setTorrentPort').value,
     verifyHashes: $('#setVerify').checked,
     failover: $('#setFailover').checked,
   });

@@ -39,10 +39,22 @@ public sealed class Settings
 
     [JsonIgnore] public string ConfigPath { get; set; } = "";
 
-    /// <summary>Everything the app writes lives here, in one folder beside the executable.</summary>
+    /// <summary>Everything the app writes lives in one folder named this.</summary>
     public const string RootFolder = "steam2info";
 
-    public static string RootFor(string baseDir) => Path.Combine(baseDir, RootFolder);
+    /// <summary>
+    /// On macOS this cannot be beside the executable: a freshly downloaded, still-quarantined
+    /// .app is run by Gatekeeper from a randomized, read-only location (App Translocation) unless
+    /// the user has already moved it out of its download location, so writing there crashes on
+    /// first launch. ~/Library/Application Support is always writable and stable regardless of
+    /// where the .app itself lives. Windows and Linux keep the simpler beside-the-executable
+    /// layout, which is portable (an install can be moved as one folder) and doesn't have an
+    /// equivalent translocation mechanism.
+    /// </summary>
+    public static string RootFor(string baseDir) => OperatingSystem.IsMacOS()
+        ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            "Library", "Application Support", RootFolder)
+        : Path.Combine(baseDir, RootFolder);
 
     private static readonly JsonSerializerOptions JsonOpts = new() { WriteIndented = true };
 

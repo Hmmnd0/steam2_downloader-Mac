@@ -15,10 +15,10 @@ Download from the [latest release](https://github.com/Hmmnd0/steam2_downloader-M
   Opens `http://127.0.0.1:5099` in your browser; no Terminal needed.
 - **`.zip`** — a raw binary, for running from Terminal with flags (see below).
 
-Everything ships unsigned, so macOS Gatekeeper will block the first launch either way. For the
-`.app`: right-click it → **Open** → **Open** again in the dialog (or System Settings → Privacy &
-Security → **Open Anyway**, if Gatekeeper already blocked it once). For the raw binary from the
-zip, clear the quarantine flag once instead:
+A signed and notarized release opens with no warning at all. If a particular build isn't (CI's
+automated builds are ad-hoc-signed, not notarized), Gatekeeper blocks the first launch: right-click
+the app → **Open** → **Open** again in the dialog. For the raw binary from the zip, clear the
+quarantine flag once instead:
 
 ```
 xattr -d com.apple.quarantine steam2browser
@@ -32,8 +32,11 @@ Then, from Terminal:
 ./steam2browser --no-browser      # do not launch a browser
 ```
 
-Everything it writes lives in `steam2info/` next to the executable — the name cache, downloads
-(`archive/blobs`, `archive/dats`) and extracted files (`extracted/`).
+Everything it writes lives in `~/Library/Application Support/steam2info/` — the name cache,
+downloads (`archive/blobs`, `archive/dats`) and extracted files (`extracted/`). Not beside the
+executable: a freshly downloaded `.app` runs from a randomized read-only location the first time
+(macOS App Translocation) unless it's already been moved out of Downloads, so writing there would
+crash on first launch.
 
 The release carries a snapshot of the whole catalog inside the executable, so the first run needs
 no network at all. Fetching that index instead would mean 13 MB of `*_dates.txt` plus two ~20 MB

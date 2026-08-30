@@ -50,6 +50,12 @@ public sealed class IndexLoader(ArchiveClient client, Settings settings)
 
                     Status.Ready = true;
                     Done(built, $"snapshot from {snapshot.GeneratedUtc:yyyy-MM-dd}");
+
+                    // A snapshot built without --with-sizes carries none, and this branch used to
+                    // return before anything could fill them in — leaving every depot at 0 bytes
+                    // and the archive total blank, permanently.
+                    if (withSizes && !built.SizesLoaded) await LoadSizesAsync(false, ct);
+
                     return;
                 }
             }

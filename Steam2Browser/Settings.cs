@@ -15,6 +15,14 @@ public sealed class Settings
     public bool Failover { get; set; } = true;
 
     public int Concurrency { get; set; } = 8;
+
+    /// <summary>
+    /// Fetch one file at a time over a single connection, blobs first and then dats.
+    /// The mirrors serve a new connection slowly and only ramp up while one keeps asking, so many
+    /// parallel streams — or one file split into ranges — leave every stream stuck at the cold rate.
+    /// Turn off to use <see cref="Concurrency"/> parallel files and ranged segments instead.
+    /// </summary>
+    public bool SequentialDownloads { get; set; } = true;
     public bool VerifyHashes { get; set; } = true;
     public int TorrentPort { get; set; }
 

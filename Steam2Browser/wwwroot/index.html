@@ -99,12 +99,20 @@
     </label>
 
     <label>Parallel downloads
+      <span class="hint">only used when the single-connection option below is off</span>
       <input id="setConcurrency" type="number" min="1" max="64">
     </label>
 
     <label>Torrent port
       <span class="hint">0 chooses a random port; set your VPN forwarded port here</span>
       <input id="setTorrentPort" type="number" min="0" max="65535">
+    </label>
+
+    <label class="row">
+      <input id="setSequential" type="checkbox">
+      <span>One file at a time, single connection
+        <span class="hint">blobs first, then dats. The mirrors ramp a connection up over time, so
+        parallel files and split ranges all stay stuck at the slow starting rate</span></span>
     </label>
 
     <label class="row">

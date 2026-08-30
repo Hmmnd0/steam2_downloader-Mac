@@ -27,6 +27,12 @@ public sealed class ArchiveClient(HttpClient http)
     /// <summary>When true, a failed request is retried against the remaining mirrors.</summary>
     public bool Failover { get; set; } = true;
 
+    /// <summary>
+    /// Split large dats into parallel ranges. Off by default: these mirrors ramp a connection up
+    /// over time, so every extra range is another cold stream competing with the one that warmed up.
+    /// </summary>
+    public bool UseSegments { get; set; }
+
     private IEnumerable<Mirror> Order()
     {
         yield return Primary;
@@ -170,7 +176,7 @@ public sealed class ArchiveClient(HttpClient http)
         Mirror mirror, Entry entry, string partPath, long resumeFrom,
         Action<long, long>? onProgress, CancellationToken ct)
     {
-        if (entry.Kind == Kind.Dat && (entry.ApproxSize < 0 || entry.ApproxSize >= SegmentedThresholdBytes))
+        if (UseSegments && entry.Kind == Kind.Dat && (entry.ApproxSize < 0 || entry.ApproxSize >= SegmentedThresholdBytes))
         {
             var segmented = await TryPullSegmentedAsync(mirror, entry, partPath, resumeFrom, onProgress, ct);
             if (segmented is not null) return segmented.Value;

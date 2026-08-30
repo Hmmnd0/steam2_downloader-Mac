@@ -30,6 +30,7 @@ var client = new ArchiveClient(http)
 {
     Primary = Mirrors.ById(settings.MirrorId),
     Failover = settings.Failover,
+    UseSegments = !settings.SequentialDownloads,
 };
 var loader = new IndexLoader(client, settings);
 var torrent = new TorrentSource(settings);
@@ -139,6 +140,7 @@ app.MapGet("/api/state", () => new
         settings.MirrorId,
         settings.Failover,
         settings.Concurrency,
+        settings.SequentialDownloads,
         settings.VerifyHashes,
         settings.TorrentPort,
         settings.ExtractOutDir,
@@ -219,6 +221,11 @@ app.MapPost("/api/settings", async (SettingsPatch patch) =>
     if (patch.MirrorId is { } mid) { settings.MirrorId = mid; client.Primary = Mirrors.ById(mid); }
     if (patch.Failover is { } fo) { settings.Failover = fo; client.Failover = fo; }
     if (patch.Concurrency is { } cc) settings.Concurrency = Math.Clamp(cc, 1, 64);
+    if (patch.SequentialDownloads is { } seq)
+    {
+        settings.SequentialDownloads = seq;
+        client.UseSegments = !seq;
+    }
     if (patch.VerifyHashes is { } vh) settings.VerifyHashes = vh;
     if (patch.TorrentPort is { } tp)
     {
@@ -538,7 +545,7 @@ return 0;
 // ---------------- request bodies ----------------
 
 internal sealed record SettingsPatch(
-    string? MirrorId, bool? Failover, int? Concurrency, bool? VerifyHashes,
+    string? MirrorId, bool? Failover, int? Concurrency, bool? VerifyHashes, bool? SequentialDownloads,
     int? TorrentPort, string? DataDir, string? ExtractOutDir, string[]? ExtraTrackers);
 
 internal sealed record ReloadRequest(bool Refresh, bool Sizes);

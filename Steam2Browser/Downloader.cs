@@ -118,22 +118,31 @@ public sealed class DownloadManager(ArchiveClient client, Settings settings, Tor
             job.Say($"{ordered.Count} file(s) are not in the torrent — fetching those over HTTP");
         }
 
-        var tasks = ordered.Select(async pf =>
-        {
-            await gate.WaitAsync(ct);
-            try
-            {
-                await OneFileAsync(job, pf, ct);
-            }
-            finally
-            {
-                gate.Release();
-            }
-        });
-
         try
         {
-            await Task.WhenAll(tasks);
+            if (settings.SequentialDownloads)
+            {
+                // The mirrors hand a fresh connection a slow rate and only ramp it up while that
+                // one connection keeps asking. Parallel files, and ranged segments within a file,
+                // therefore all sit at the cold rate at once. One stream per phase warms up.
+                var blobs = ordered.Where(f => f.Entry.Kind == Kind.Blob).ToList();
+                var dats = ordered.Where(f => f.Entry.Kind == Kind.Dat).ToList();
+
+                job.Say($"single stream: {blobs.Count} blob(s) first, then {dats.Count} dat(s)");
+
+                await OnePhaseAsync(job, blobs, "blobs", ct);
+                await OnePhaseAsync(job, dats, "dats", ct);
+            }
+            else
+            {
+                await Task.WhenAll(ordered.Select(async pf =>
+                {
+                    await gate.WaitAsync(ct);
+                    try { await OneFileAsync(job, pf, ct); }
+                    finally { gate.Release(); }
+                }));
+            }
+
             Finish(job);
         }
         catch (OperationCanceledException)
@@ -152,6 +161,20 @@ public sealed class DownloadManager(ArchiveClient client, Settings settings, Tor
             job.FinishedUtc = DateTime.UtcNow;
             job.SpeedBps = 0;
             job.Active.Clear();
+        }
+    }
+
+    /// <summary>Works through one kind of file strictly one at a time, keeping a single stream alive.</summary>
+    private async Task OnePhaseAsync(DownloadJob job, List<PlanFile> files, string what, CancellationToken ct)
+    {
+        if (files.Count == 0) return;
+
+        job.Say($"{what}: {files.Count} file(s)");
+
+        foreach (var pf in files)
+        {
+            ct.ThrowIfCancellationRequested();
+            await OneFileAsync(job, pf, ct);
         }
     }
 

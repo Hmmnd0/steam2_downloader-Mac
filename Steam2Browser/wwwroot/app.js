@@ -128,7 +128,7 @@ function renderUpdate(u) {
     chip.className = 'chip ' + u.state;
     chip.textContent = (u.state === 'available' ? '↑ ' : '! ') + UPDATE_LABEL[u.state];
     chip.title = u.message || '';
-    chip.href = u.commitUrl || u.repoUrl || '#';
+    chip.href = 'https://github.com/extremebleem/steam2_downloader/releases';
   }
 
   const text = $('#updText');

@@ -45,6 +45,8 @@ public sealed class NameCacheStatus
     public int Named;
     public int Failed;
     public int Current;
+    public int Curated;
+    public int Remaining;
     public string Message = "";
 }
 
@@ -71,7 +73,7 @@ public sealed class SteamPassStatus
 ///
 /// Every record is appended to names.jsonl as it lands, so either pass resumes where it stopped.
 /// </summary>
-public sealed class NameCache(ArchiveClient client, HttpClient http)
+public sealed class NameCache(ArchiveClient client, HttpClient http, LabelSource labels)
 {
     private readonly ConcurrentDictionary<int, NameRecord> _byDepot = new();
     private readonly SemaphoreSlim _writeLock = new(1, 1);
@@ -85,6 +87,29 @@ public sealed class NameCache(ArchiveClient client, HttpClient http)
 
     public NameRecord? Get(int depot) => _byDepot.GetValueOrDefault(depot);
     public bool Has(int depot) => _byDepot.ContainsKey(depot);
+
+    /// <summary>
+    /// The name to show. Curated labels win: they are proper product names, where a manifest only
+    /// yields directory names. Steam comes next, then the manifest.
+    /// </summary>
+    public string DisplayFor(int depot)
+    {
+        var curated = labels.Get(depot);
+        if (!string.IsNullOrEmpty(curated)) return LabelSource.Short(curated);
+
+        return Get(depot)?.Display ?? "";
+    }
+
+    /// <summary>Where the shown name came from: curated | steam | manifest, or null when unnamed.</summary>
+    public string? SourceFor(int depot)
+    {
+        if (labels.Has(depot)) return "curated";
+
+        var rec = Get(depot);
+        if (rec is null) return null;
+        if (!string.IsNullOrEmpty(rec.SteamName)) return "steam";
+        return string.IsNullOrEmpty(rec.Label) ? null : "manifest";
+    }
 
     /// <summary>True once the manifest pass has had its answer for this depot, hit or miss.</summary>
     private static bool HasManifest(NameRecord? r) =>
@@ -158,12 +183,21 @@ public sealed class NameCache(ArchiveClient client, HttpClient http)
     private void Recount()
     {
         Status.Cached = _byDepot.Count;
-        Status.Named = _byDepot.Values.Count(r => !string.IsNullOrEmpty(r.Display));
+        Status.Curated = labels.Count;
+
+        // A depot is named whatever the source. Counting only our own cache understated it badly
+        // once the curated list arrived: it covers most of the archive and never touches this cache.
+        Status.Named = labels.Count
+                       + _byDepot.Values.Count(r => !labels.Has(r.Depot) && !string.IsNullOrEmpty(r.Display));
+
         Status.Failed = _byDepot.Values.Count(r => r.Error is not null);
 
         Steam.Checked = _byDepot.Values.Count(r => r.SteamChecked);
         Steam.Found = _byDepot.Values.Count(r => !string.IsNullOrEmpty(r.SteamName));
     }
+
+    /// <summary>Re-reads the derived counters, for when the curated list lands after startup.</summary>
+    public void Refresh() => Recount();
 
     public void Stop() => _cts?.Cancel();
     public void StopSteam() => _steamCts?.Cancel();
@@ -192,8 +226,11 @@ public sealed class NameCache(ArchiveClient client, HttpClient http)
         {
             // Keyed on whether the manifest itself was read, not on the depot merely being present:
             // the Steam pass may already have created a record for it.
+            // Skip anything the curated list already names — that is the whole archive today, so
+            // this normally does no network work at all.
             var todo = catalog.Ordered
                 .Where(d => d.Blobs.Count > 0)
+                .Where(d => !labels.Has(d.Id))
                 .Where(d =>
                 {
                     var r = _byDepot.GetValueOrDefault(d.Id);
@@ -202,6 +239,7 @@ public sealed class NameCache(ArchiveClient client, HttpClient http)
                 .ToList();
 
             Status.Total = catalog.Ordered.Count;
+            Status.Remaining = todo.Count;
             Status.Message = $"{todo.Count} depots left to name";
 
             using var gate = new SemaphoreSlim(Math.Max(1, concurrency));
@@ -215,6 +253,7 @@ public sealed class NameCache(ArchiveClient client, HttpClient http)
                     var fresh = await ReadOneAsync(depot, ct);
                     var merged = MergeManifest(depot.Id, fresh);
                     await AppendAsync(merged, ct);
+                    Interlocked.Decrement(ref Status.Remaining);
                     Recount();
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
@@ -244,6 +283,7 @@ public sealed class NameCache(ArchiveClient client, HttpClient http)
         {
             Status.Running = false;
             Status.Current = 0;
+            Status.Remaining = 0;
         }
     }
 
@@ -305,6 +345,7 @@ public sealed class NameCache(ArchiveClient client, HttpClient http)
         try
         {
             var todo = catalog.Ordered
+                .Where(d => !labels.Has(d.Id))
                 .Where(d => !_byDepot.TryGetValue(d.Id, out var r) || recheckMisses || !r.SteamChecked)
                 .Select(d => d.Id)
                 .ToList();

@@ -29,11 +29,13 @@ var client = new ArchiveClient(http)
     Failover = settings.Failover,
 };
 var loader = new IndexLoader(client, settings);
-var downloads = new DownloadManager(client, settings);
+var torrent = new TorrentSource(settings);
+var downloads = new DownloadManager(client, settings, torrent);
 var extractor = new ExtractorRunner(settings);
 var updates = new UpdateChecker(http);
 updates.Initialise();
-var names = new NameCache(client, http);
+var labels = new LabelSource(http);
+var names = new NameCache(client, http, labels);
 names.Load(Settings.RootFor(baseDir));
 
 // Maintainer tool: `--build-index <path>` snapshots the whole catalog into one compact file, which
@@ -136,6 +138,7 @@ app.MapGet("/api/state", () => new
         settings.Concurrency,
         settings.VerifyHashes,
         settings.ExtractOutDir,
+        trackers = settings.TrackersToUse,
     },
     mirrors = Mirrors.All.Select(m => new
     {
@@ -157,14 +160,43 @@ app.MapGet("/api/state", () => new
         updates.Status.CommitUrl,
         updates.Status.CheckedUtc,
     },
+    labels = new
+    {
+        labels.Status.State,
+        labels.Status.Message,
+        labels.Status.Error,
+        labels.Status.Count,
+        labels.Status.Source,
+        labels.Status.FetchedUtc,
+    },
     names = new
     {
         names.Status.Running,
+        names.Status.Curated,
         names.Status.Cached,
         names.Status.Named,
         names.Status.Failed,
         names.Status.Current,
+        names.Status.Remaining,
         names.Status.Message,
+    },
+    torrent = new
+    {
+        torrent.Status.State,
+        torrent.Status.Message,
+        torrent.Status.Error,
+        torrent.Status.HasMetadata,
+        torrent.Status.TotalFiles,
+        torrent.Status.SelectedFiles,
+        torrent.Status.SelectedBytes,
+        torrent.Status.SelectedProgress,
+        torrent.Status.Trackers,
+        torrent.Status.Peers,
+        torrent.Status.Seeds,
+        torrent.Status.DownloadRate,
+        torrent.Status.UploadRate,
+        torrent.Status.TorrentState,
+        magnet = TorrentSource.Magnet,
     },
     steam = new
     {
@@ -185,6 +217,7 @@ app.MapPost("/api/settings", (SettingsPatch patch) =>
     if (patch.VerifyHashes is { } vh) settings.VerifyHashes = vh;
     if (!string.IsNullOrWhiteSpace(patch.DataDir)) settings.DataDir = patch.DataDir!;
     if (!string.IsNullOrWhiteSpace(patch.ExtractOutDir)) settings.ExtractOutDir = patch.ExtractOutDir!;
+    if (patch.ExtraTrackers is { } tr) settings.ExtraTrackers = tr;
     settings.Save();
     return Results.Ok(new { ok = true });
 });
@@ -216,6 +249,12 @@ app.MapPost("/api/names/start", (bool? retryFailed) =>
 
 app.MapPost("/api/names/stop", () => { names.Stop(); return Results.Ok(new { ok = true }); });
 
+app.MapPost("/api/names/labels/refresh", async (CancellationToken ct) =>
+{
+    await labels.RefreshAsync(Settings.RootFor(AppContext.BaseDirectory), ct);
+    return Results.Ok(new { labels.Status.State, labels.Status.Message, labels.Status.Count });
+});
+
 app.MapPost("/api/names/steam/start", (bool? recheckMisses) =>
 {
     if (loader.Catalog is null) return Results.BadRequest(new { error = "index not loaded yet" });
@@ -224,6 +263,18 @@ app.MapPost("/api/names/steam/start", (bool? recheckMisses) =>
 });
 
 app.MapPost("/api/names/steam/stop", () => { names.StopSteam(); return Results.Ok(new { ok = true }); });
+
+app.MapPost("/api/torrent/start", () =>
+{
+    _ = torrent.EnsureStartedAsync();
+    return Results.Ok(new { ok = true });
+});
+
+app.MapPost("/api/torrent/stop", async () =>
+{
+    await torrent.StopAsync();
+    return Results.Ok(new { ok = true });
+});
 
 app.MapPost("/api/update/check", async (CancellationToken ct) =>
 {
@@ -258,13 +309,13 @@ app.MapGet("/api/depots", (string? q, string? sort, string? dir, string? filter,
         {
             items = items.Where(d =>
                 d.Id.ToString() == needle ||
-                string.Equals(names.Get(d.Id)?.Display, needle, StringComparison.OrdinalIgnoreCase));
+                string.Equals(names.DisplayFor(d.Id), needle, StringComparison.OrdinalIgnoreCase));
         }
         else
         {
             items = items.Where(d =>
                 d.Id.ToString().Contains(needle, StringComparison.Ordinal) ||
-                (names.Get(d.Id)?.Display.Contains(needle, StringComparison.OrdinalIgnoreCase) ?? false));
+                names.DisplayFor(d.Id).Contains(needle, StringComparison.OrdinalIgnoreCase));
         }
     }
 
@@ -301,7 +352,8 @@ app.MapGet("/api/depots", (string? q, string? sort, string? dir, string? filter,
     return Results.Ok(new
     {
         total = list.Count,
-        items = list.Skip(offset).Take(pageSize).Select(d => Dto.Summary(d, names.Get(d.Id))),
+        items = list.Skip(offset).Take(pageSize)
+            .Select(d => Dto.Summary(d, names.Get(d.Id), names.DisplayFor(d.Id), names.SourceFor(d.Id))),
     });
 });
 
@@ -315,7 +367,7 @@ app.MapGet("/api/depots/{id:int}", (int id) =>
 
     return Results.Ok(new
     {
-        summary = Dto.Summary(d, names.Get(d.Id)),
+        summary = Dto.Summary(d, names.Get(d.Id), names.DisplayFor(d.Id), names.SourceFor(d.Id)),
         versions = Enumerable.Range(0, d.MaxVersion + 1).Select(v => new
         {
             version = v,
@@ -427,13 +479,18 @@ _ = updates.CheckAsync();
 // Startup: load the index, race the mirrors, switch to the fastest, then start naming depots.
 _ = Task.Run(async () =>
 {
+    // Curated names first: they cover the whole archive today, which means both sweeps below
+    // usually find nothing left to do and no blob or store request is made at all.
+    await labels.LoadAsync(Settings.RootFor(baseDir));
+    names.Refresh();
+
     await loader.LoadAsync(refreshIndex: false, withSizes: true);
     if (loader.Catalog is null) return;
 
     try
     {
         await Mirrors.TestAllAsync(http);
-        var best = Mirrors.All.Where(m => m.Reachable && m.SpeedBps > 0).MaxBy(m => m.SpeedBps);
+        var best = Mirrors.All.Where(m => !m.IsTorrent && m.Reachable && m.SpeedBps > 0).MaxBy(m => m.SpeedBps);
         if (best is not null && best.Id != client.Primary.Id)
         {
             client.Primary = best;
@@ -470,7 +527,7 @@ return 0;
 
 internal sealed record SettingsPatch(
     string? MirrorId, bool? Failover, int? Concurrency, bool? VerifyHashes,
-    string? DataDir, string? ExtractOutDir);
+    string? DataDir, string? ExtractOutDir, string[]? ExtraTrackers);
 
 internal sealed record ReloadRequest(bool Refresh, bool Sizes);
 internal sealed record PlanRequest(int Depot, int Version, string? BlobCrc);
@@ -479,11 +536,11 @@ internal sealed record RevealRequest(string Path);
 
 internal static class Dto
 {
-    public static object Summary(Depot d, NameRecord? name = null) => new
+    public static object Summary(Depot d, NameRecord? name = null, string? display = null, string? source = null) => new
     {
         id = d.Id,
-        name = string.IsNullOrEmpty(name?.Display) ? null : name!.Display,
-        nameSource = name is null ? null : string.IsNullOrEmpty(name.SteamName) ? "manifest" : "steam",
+        name = string.IsNullOrEmpty(display) ? null : display,
+        nameSource = source,
         manifestName = string.IsNullOrEmpty(name?.Label) ? null : name!.Label,
         steamType = name?.SteamType,
         roots = name?.Roots,

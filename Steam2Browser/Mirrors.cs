@@ -19,20 +19,25 @@ public sealed class Mirror
     public string? Error;
     public DateTime? TestedUtc;
 
+    /// <summary>The BitTorrent swarm rather than an HTTP host; it has no base URL to speak of.</summary>
+    public bool IsTorrent { get; init; }
+
     public string Url(string relPath) => $"{BaseUrl.TrimEnd('/')}/{relPath.TrimStart('/')}";
 }
 
 public static class Mirrors
 {
     /// <summary>
-    /// All three serve byte-identical content (same ETag / Content-Length / Last-Modified).
-    /// Schemes differ and are not interchangeable: de answers only on https, ro and us only on http.
+    /// The three HTTP mirrors serve byte-identical content (same ETag / Content-Length /
+    /// Last-Modified). Schemes differ and are not interchangeable: de answers only on https, ro and
+    /// us only on http. The fourth entry is the BitTorrent swarm, which carries the same 12.11 TiB.
     /// </summary>
     public static readonly Mirror[] All =
     [
         new() { Id = "de", Name = "Germany", Region = "EU", BaseUrl = "https://de.steam2.download" },
         new() { Id = "ro", Name = "Romania", Region = "EU", BaseUrl = "http://ro.steam2.download" },
         new() { Id = "us", Name = "United States", Region = "NA", BaseUrl = "http://us.steam2.download" },
+        new() { Id = "torrent", Name = "BitTorrent swarm", Region = "P2P", BaseUrl = "", IsTorrent = true },
     ];
 
     public static Mirror ById(string? id) =>
@@ -56,7 +61,8 @@ public static class Mirrors
     /// <summary>Times a fixed-size ranged read from every mirror, in parallel.</summary>
     public static async Task TestAllAsync(HttpClient http, CancellationToken ct = default)
     {
-        await Task.WhenAll(All.Select(m => TestAsync(http, m, ct)));
+        // The swarm has no URL to time, and its rate depends on peers rather than on a probe.
+        await Task.WhenAll(All.Where(m => !m.IsTorrent).Select(m => TestAsync(http, m, ct)));
     }
 
     public static async Task TestAsync(HttpClient http, Mirror m, CancellationToken ct = default)

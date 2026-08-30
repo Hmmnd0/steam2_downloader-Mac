@@ -45,76 +45,6 @@ jobs:
           path: Steam2Browser/index.bin
           if-no-files-found: ignore
 
-  build-windows:
-    needs: build-index
-    runs-on: windows-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '10.0.x'
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: index-bin
-          path: Steam2Browser
-        continue-on-error: true
-
-      - name: Publish
-        shell: pwsh
-        run: |
-          dotnet publish Steam2Browser/Steam2Browser.csproj `
-            -c Release -r win-x64 --self-contained true `
-            -p:PublishSingleFile=true `
-            -p:IncludeNativeLibrariesForSelfExtract=true `
-            -p:EnableCompressionInSingleFile=true `
-            -p:PublishTrimmed=false `
-            -p:DebugType=none `
-            -o publish
-
-      - name: Trim publish leftovers
-        shell: pwsh
-        # The UI and the depot key table are embedded in the exe, so the loose copies
-        # ASP.NET emits are dead weight. web.config only matters under IIS.
-        run: |
-          Remove-Item -Recurse -Force publish/wwwroot -ErrorAction SilentlyContinue
-          Remove-Item -Force publish/web.config -ErrorAction SilentlyContinue
-          Remove-Item -Force publish/*.staticwebassets.endpoints.json -ErrorAction SilentlyContinue
-          Get-ChildItem publish
-
-      - name: Smoke test
-        shell: pwsh
-        # Catches a build that publishes but cannot start — the embedded UI failing to
-        # resolve would otherwise only show up on a user's machine.
-        run: |
-          $exe = Start-Process -FilePath publish/steam2browser.exe `
-            -ArgumentList '--no-browser','--port=5099' -PassThru
-          $ok = $false
-          foreach ($i in 1..30) {
-            Start-Sleep -Seconds 2
-            try {
-              $r = Invoke-WebRequest -Uri http://127.0.0.1:5099/ -TimeoutSec 5 -UseBasicParsing
-              if ($r.StatusCode -eq 200 -and $r.Content -match 'Steam2 Archive') { $ok = $true; break }
-            } catch { }
-          }
-          Stop-Process -Id $exe.Id -Force -ErrorAction SilentlyContinue
-          if (-not $ok) { throw 'the published exe did not serve its UI' }
-          Write-Host 'served the UI'
-
-      - name: Package
-        shell: pwsh
-        run: |
-          Copy-Item README.md publish/
-          Compress-Archive -Path publish/* -DestinationPath steam2browser-win-x64.zip -Force
-          Get-Item steam2browser-win-x64.zip | Select-Object Name, Length
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: release-win-x64
-          path: steam2browser-win-x64.zip
-
   build-macos:
     needs: build-index
     runs-on: macos-latest # arm64
@@ -240,7 +170,7 @@ jobs:
             steam2browser-osx-arm64.dmg
 
   release:
-    needs: [build-windows, build-macos]
+    needs: build-macos
     runs-on: ubuntu-latest
 
     steps:
@@ -264,13 +194,12 @@ jobs:
           sha="$(echo ${{ github.sha }} | cut -c1-7)"
           notes="Built from commit ${sha}.
 
-          Windows: download \`steam2browser-win-x64.zip\`, unzip, run \`steam2browser.exe\`.
           macOS (Apple Silicon): download \`steam2browser-osx-arm64.dmg\`, drag the app into
           Applications, right-click it and choose Open (it is unsigned, so Gatekeeper blocks a
           plain double-click the first time). Or grab the \`.zip\` for the raw binary instead.
 
-          Self-contained: no .NET install needed. Everything it writes goes to \`steam2info/\`
-          next to the executable."
+          Self-contained: no .NET install needed. Data lives in
+          \`~/Library/Application Support/steam2info/\`."
 
           gh release create "$tag" dist/* \
             --title "$tag" \

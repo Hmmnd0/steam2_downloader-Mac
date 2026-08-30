@@ -38,6 +38,13 @@ public sealed class Settings
     /// has the next files ready. 0 disables it. Fire-and-forget, so it cannot slow anything down.
     /// </summary>
     public int WarmupLookahead { get; set; } = 2;
+
+    /// <summary>
+    /// Dats at least this large are fetched one at a time, after the smaller ones. Two concurrent
+    /// long sequential reads make disk-backed storage seek between them, which costs more than the
+    /// parallelism gains; short reads never get far enough for that to matter. 0 disables the split.
+    /// </summary>
+    public long BigFileBytes { get; set; } = 30L * 1024 * 1024;
     public bool VerifyHashes { get; set; } = true;
     public int TorrentPort { get; set; }
 
@@ -100,6 +107,7 @@ public sealed class Settings
         if (s.BlobConcurrency is < 1 or > 128) s.BlobConcurrency = 32;
         if (s.DatConcurrency is < 1 or > 64) s.DatConcurrency = 2;
         if (s.WarmupLookahead is < 0 or > 16) s.WarmupLookahead = 2;
+        if (s.BigFileBytes < 0) s.BigFileBytes = 30L * 1024 * 1024;
         if (s.TorrentPort is < 0 or > 65535) s.TorrentPort = 0;
         return s;
     }

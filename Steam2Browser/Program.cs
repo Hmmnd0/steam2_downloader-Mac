@@ -39,6 +39,7 @@ var extractor = new ExtractorRunner(settings);
 var updates = new UpdateChecker(http);
 updates.Initialise();
 var labels = new LabelSource(http);
+var changes = new ChangeIndex(client, settings);
 var names = new NameCache(client, http, labels);
 names.Load(Settings.RootFor(baseDir));
 
@@ -86,6 +87,67 @@ if (buildIndexAt >= 0)
                       $"— {cat.Ordered.Count} depots, {cat.DatCount + cat.BlobCount} files" +
                       (cat.SizesLoaded ? ", with sizes" : ", no sizes"));
     return 0;
+}
+
+// ---------------- port ----------------
+
+// Kestrel only discovers a busy port deep inside app.Run(), where the failure surfaces as a wall
+// of stack trace. Settle it here instead: hand the user over to an instance that is already
+// running, or step aside to the next free port.
+static bool PortIsFree(int candidate)
+{
+    try
+    {
+        var probe = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, candidate);
+        probe.Start();
+        probe.Stop();
+        return true;
+    }
+    catch (System.Net.Sockets.SocketException)
+    {
+        return false;
+    }
+}
+
+static async Task<bool> AnotherInstanceAsync(int candidate)
+{
+    try
+    {
+        using var probe = new HttpClient { Timeout = TimeSpan.FromSeconds(2) };
+        var body = await probe.GetStringAsync($"http://127.0.0.1:{candidate}/api/state");
+        return body.Contains("\"mirrors\"", StringComparison.Ordinal);
+    }
+    catch
+    {
+        return false;
+    }
+}
+
+if (!PortIsFree(port))
+{
+    if (await AnotherInstanceAsync(port))
+    {
+        string running = $"http://127.0.0.1:{port}/";
+        Console.WriteLine($"steam2browser is already running at {running} — opening that one");
+
+        if (!noBrowser)
+        {
+            try { Process.Start(new ProcessStartInfo(running) { UseShellExecute = true }); }
+            catch { /* the URL is printed above */ }
+        }
+        return 0;
+    }
+
+    int free = Enumerable.Range(port + 1, 20).FirstOrDefault(PortIsFree, -1);
+    if (free < 0)
+    {
+        Console.Error.WriteLine($"port {port} is taken and nothing is free through {port + 20}.");
+        Console.Error.WriteLine("Pass --port=NNNN to choose another one.");
+        return 1;
+    }
+
+    Console.WriteLine($"port {port} is taken by something else — using {free}");
+    port = free;
 }
 
 var builder = WebApplication.CreateBuilder(new WebApplicationOptions { Args = args, ContentRootPath = baseDir });
@@ -144,6 +206,7 @@ app.MapGet("/api/state", () => new
         settings.BlobConcurrency,
         settings.DatConcurrency,
         settings.WarmupLookahead,
+        settings.BigFileBytes,
         settings.VerifyHashes,
         settings.TorrentPort,
         settings.ExtractOutDir,
@@ -232,6 +295,7 @@ app.MapPost("/api/settings", async (SettingsPatch patch) =>
     if (patch.BlobConcurrency is { } bc) settings.BlobConcurrency = Math.Clamp(bc, 1, 128);
     if (patch.DatConcurrency is { } dc) settings.DatConcurrency = Math.Clamp(dc, 1, 64);
     if (patch.WarmupLookahead is { } wl) settings.WarmupLookahead = Math.Clamp(wl, 0, 16);
+    if (patch.BigFileMb is { } bm) settings.BigFileBytes = Math.Max(0, bm) * 1024L * 1024L;
     if (patch.VerifyHashes is { } vh) settings.VerifyHashes = vh;
     if (patch.TorrentPort is { } tp)
     {
@@ -402,6 +466,69 @@ app.MapGet("/api/depots/{id:int}", (int id) =>
     });
 });
 
+// The whole version history of a depot, newest first. Counts appear for versions whose blob is
+// already on disk; the rest need the bulk fetch below, which costs kilobytes per version.
+app.MapGet("/api/depots/{id:int}/versions", (int id) =>
+{
+    var cat = loader.Catalog;
+    if (cat is null || !cat.Depots.TryGetValue(id, out var depot)) return Results.NotFound();
+
+    var fetch = changes.StatusFor(id);
+
+    return Results.Ok(new
+    {
+        depot = id,
+        fetch = new { fetch.Running, fetch.Done, fetch.Total, fetch.Failed, fetch.Message },
+        versions = changes.Summary(depot).Select(v => new
+        {
+            v.Version, v.Crc, v.Date, v.Local,
+            v.ChangedCount, v.ChangedBytes, v.FilesInVersion, v.WholeSet, v.Error,
+        }),
+    });
+});
+
+// The files one version changed. Read straight from that version's blob, no dat involved.
+app.MapGet("/api/depots/{id:int}/versions/{version:int}/files", (int id, int version, string? crc) =>
+{
+    var cat = loader.Catalog;
+    if (cat is null || !cat.Depots.TryGetValue(id, out var depot)) return Results.NotFound();
+
+    var candidates = depot.Blobs.Where(b => b.Version == version).ToList();
+    var blob = !string.IsNullOrWhiteSpace(crc)
+        ? candidates.FirstOrDefault(b => b.CrcHex.Equals(crc.Trim(), StringComparison.OrdinalIgnoreCase))
+        : candidates.FirstOrDefault();
+
+    if (blob is null) return Results.Ok(new { error = $"no blob for version {version}" });
+
+    try
+    {
+        var files = changes.FilesFor(blob);
+        if (files is null) return Results.Ok(new { needsFetch = true, crc = blob.CrcHex });
+
+        return Results.Ok(new
+        {
+            version,
+            crc = blob.CrcHex,
+            count = files.Count,
+            files = files.Take(20000).Select(f => new { path = f.Path, size = f.Size, mode = f.Mode }),
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Ok(new { error = ex.Message });
+    }
+});
+
+// Pulls every blob the depot has, so the full history can be expanded offline.
+app.MapPost("/api/depots/{id:int}/blobs", (int id) =>
+{
+    var cat = loader.Catalog;
+    if (cat is null || !cat.Depots.TryGetValue(id, out var depot)) return Results.NotFound();
+
+    changes.FetchAll(depot);
+    return Results.Ok(new { ok = true, blobs = depot.Blobs.Count });
+});
+
 app.MapGet("/api/search", (string? q, int? take) =>
 {
     var cat = loader.Catalog;
@@ -545,13 +672,24 @@ if (!noBrowser)
     catch { /* headless is fine, the URL is printed above */ }
 }
 
-app.Run();
+try
+{
+    app.Run();
+}
+catch (IOException ex)
+{
+    // Something grabbed the port between the probe above and Kestrel binding it.
+    Console.Error.WriteLine($"could not start on port {port}: {ex.Message}");
+    Console.Error.WriteLine("Pass --port=NNNN to choose another one.");
+    return 1;
+}
+
 return 0;
 
 // ---------------- request bodies ----------------
 
 internal sealed record SettingsPatch(
-    string? MirrorId, bool? Failover, int? Concurrency, bool? VerifyHashes, bool? PhasedDownloads, int? BlobConcurrency, int? DatConcurrency, int? WarmupLookahead,
+    string? MirrorId, bool? Failover, int? Concurrency, bool? VerifyHashes, bool? PhasedDownloads, int? BlobConcurrency, int? DatConcurrency, int? WarmupLookahead, int? BigFileMb,
     int? TorrentPort, string? DataDir, string? ExtractOutDir, string[]? ExtraTrackers);
 
 internal sealed record ReloadRequest(bool Refresh, bool Sizes);

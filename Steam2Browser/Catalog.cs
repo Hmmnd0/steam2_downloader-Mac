@@ -223,17 +223,17 @@ public sealed class Catalog
             if (!blobVers.ContainsKey(v)) d.MissingBlobs.Add(v);
         }
 
+        // Blob timestamps are the trustworthy ones. Every single dat in the archive sits on an
+        // exact second (57898 of 57898), while 99.6% of blobs carry sub-second precision — the dat
+        // times were stamped when the dump was assembled, not when the version was published.
         var first = DateTime.MaxValue;
         var last = DateTime.MinValue;
-        foreach (var e in d.Dats)
+
+        var dated = d.Blobs.Where(e => e.Date != default).ToList();
+        if (dated.Count == 0) dated = d.Dats.Where(e => e.Date != default).ToList();
+
+        foreach (var e in dated)
         {
-            if (e.Date == default) continue;
-            if (e.Date < first) first = e.Date;
-            if (e.Date > last) last = e.Date;
-        }
-        foreach (var e in d.Blobs)
-        {
-            if (e.Date == default) continue;
             if (e.Date < first) first = e.Date;
             if (e.Date > last) last = e.Date;
         }

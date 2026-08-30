@@ -254,6 +254,11 @@ button:disabled { opacity: .4; cursor: default; }
 .planrow label { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .6px; }
 .planrow input[type=number] { width: 90px; }
 .planrow select { min-width: 190px; }
+.planrow .plansize {
+  flex: 1; min-width: 0; color: var(--accent);
+  font-size: 12px; font-variant-numeric: tabular-nums;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 
 .summary { display: flex; gap: 22px; flex-wrap: wrap; margin-top: 12px; }
 .summary div { display: flex; flex-direction: column; }
@@ -275,6 +280,45 @@ td.mono { font-family: var(--mono); font-size: 11px; color: var(--dim); }
 .vtable { max-height: 420px; overflow-y: auto; }
 .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--dimmer); margin-right: 6px; }
 .dot.have { background: var(--good); box-shadow: 0 0 6px #a4d00780; }
+
+/* ---------- version history ---------- */
+
+.vhist { margin-top: 12px; border-top: 1px solid #000; }
+
+.vitem { border-bottom: 1px solid #0d1620; }
+.vitem > summary {
+  display: flex; align-items: center; gap: 12px;
+  padding: 8px 10px; cursor: pointer; list-style: none;
+  font-size: 12px;
+}
+.vitem > summary::-webkit-details-marker { display: none; }
+.vitem > summary::before {
+  /* Drawn with borders rather than a glyph: no font dependency and nothing to mis-escape. */
+  content: ""; flex: none;
+  width: 0; height: 0;
+  border-left: 5px solid var(--dimmer);
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  transition: transform .15s;
+}
+.vitem[open] > summary::before { transform: rotate(90deg); transform-origin: 30% 50%; }
+.vitem > summary:hover { background: #22354a; }
+.vitem[open] > summary { background: #22354a; color: #fff; }
+
+.vitem .vver { color: #fff; font-weight: 400; min-width: 46px; font-variant-numeric: tabular-nums; }
+.vitem .vdate { color: var(--dim); font-variant-numeric: tabular-nums; min-width: 84px; }
+.vitem .vwhat { color: var(--accent); flex: 1; }
+.vitem .vwhat.dim { color: var(--dimmer); }
+.vitem .vwhat.bad { color: var(--bad); }
+.vitem .vsize { color: var(--dim); font-variant-numeric: tabular-nums; }
+.vitem .vcrc { color: var(--dimmer); font-family: var(--mono); font-size: 11px; }
+
+.vbody { padding: 4px 10px 12px; background: #16202d; }
+.vfilter { width: 100%; margin: 6px 0 8px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .vitem > summary::before { transition: none; }
+}
 
 /* ---------- activity ---------- */
 

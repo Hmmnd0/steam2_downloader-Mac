@@ -354,7 +354,7 @@ function renderDepot() {
   }
 
   d.append(planPanel(s));
-  d.append(versionsPanel(versions));
+  d.append(changesPanel(s.id));
 }
 
 function planPanel(s) {
@@ -376,8 +376,11 @@ function planPanel(s) {
   const oldest = ordered[ordered.length - 1]?.version;
 
   for (const entry of ordered) {
-    const files = [...entry.blobs, ...entry.dats];
-    const date = files.map((f) => f.date).filter(Boolean).sort().at(-1);
+    // The blob's timestamp, not the newest of the two. Every dat in the archive sits on an exact
+    // second while blobs keep sub-second precision, so dat times record when the dump was built —
+    // taking the max made both versions here show the same June date.
+    const dated = (entry.blobs.length ? entry.blobs : entry.dats);
+    const date = dated.map((f) => f.date).filter(Boolean).sort()[0];
     const forked = entry.blobs.length > 1 || entry.dats.length > 1;
 
     let label = `v${entry.version}`;
@@ -393,16 +396,20 @@ function planPanel(s) {
   vSel.value = String(s.maxVersion);
   if (!vSel.value && vSel.options.length) vSel.selectedIndex = 0;
 
+  // Only shown when a version really forked. Everywhere else it sat there greyed out on "auto",
+  // taking the space that the download size deserves.
   const crcLabel = el('label', null, 'Blob CRC');
   const crcSel = el('select');
   crcSel.id = 'planCrc';
   crcSel.append(new Option('auto', ''));
 
+  const sizeInfo = el('span', 'plansize');
+
   const planBtn = el('button', 'ghost', 'Plan');
   const dlBtn = el('button', 'primary', 'Download chain');
   const exBtn = el('button', 'ghost', 'Extract');
 
-  row.append(vLabel, vSel, crcLabel, crcSel, planBtn, dlBtn, exBtn);
+  row.append(vLabel, vSel, crcLabel, crcSel, sizeInfo, planBtn, dlBtn, exBtn);
   body.append(row);
 
   const out = el('div');
@@ -413,16 +420,52 @@ function planPanel(s) {
   const fillCrc = () => {
     const v = +vSel.value;
     const entry = state.detail.versions.find((x) => x.version === v);
+    const choices = entry?.blobs ?? [];
+
     crcSel.innerHTML = '';
     crcSel.append(new Option('auto', ''));
-    for (const b of entry?.blobs ?? []) {
-      crcSel.append(new Option(`${b.crc}  ·  ${b.date ?? ''}`, b.crc));
-    }
-    // Only a forked version leaves a real choice to make.
-    crcSel.disabled = (entry?.blobs?.length ?? 0) < 2;
+    for (const b of choices) crcSel.append(new Option(`${b.crc}  ·  ${b.date ?? ''}`, b.crc));
+
+    // Nothing to pick unless the version forked, so the control stays out of the way entirely.
+    const choose = choices.length > 1;
+    crcLabel.hidden = !choose;
+    crcSel.hidden = !choose;
   };
-  vSel.onchange = fillCrc;
-  fillCrc();
+
+  // Deltas mean a version costs everything below it too, so the figure is for the whole chain.
+  const updateSize = () => {
+    const target = +vSel.value;
+    let total = 0, have = 0, files = 0, unknown = 0, forked = false;
+
+    for (const entry of state.detail.versions) {
+      if (entry.version > target) continue;
+      if (entry.blobs.length > 1 || entry.dats.length > 1) forked = true;
+
+      for (const f of [...entry.blobs, ...entry.dats]) {
+        files++;
+        if (f.size >= 0) {
+          total += f.size;
+          if (f.local) have += f.size;
+        } else {
+          unknown++;
+        }
+      }
+    }
+
+    const left = Math.max(0, total - have);
+    const parts = [`${unknown ? '≥' : '~'}${bytes(left)} to download`];
+    if (have > 0) parts.push(`${bytes(have)} already here`);
+    parts.push(`${num(files)} files`);
+    // A fork below the target means both branches are counted; the planner picks one.
+    if (forked) parts.push('fork below — planner may need less');
+
+    sizeInfo.textContent = parts.join('  ·  ');
+    sizeInfo.title = `chain v0…v${target}: ${bytes(total)} total`;
+  };
+
+  const onVersion = () => { fillCrc(); updateSize(); };
+  vSel.onchange = onVersion;
+  onVersion();
 
   planBtn.onclick = () => doPlan(s.id, +vSel.value, crcSel.value, false);
   dlBtn.onclick = () => doPlan(s.id, +vSel.value, crcSel.value, true);
@@ -519,36 +562,176 @@ function renderPlan(plan, out) {
   out.append(wrap);
 }
 
-function versionsPanel(versions) {
+// The centre of a depot page: the whole version history, each version expandable to the files it
+// changed. Everything comes from the blobs — a version's blob holds both the manifest and the list
+// of files whose data sits in that version's dat — so no .dat is ever touched to build this.
+function changesPanel(depotId) {
   const p = el('div', 'panel');
-  p.append(el('h3', null, `Versions and dates — ${versions.length} present`));
+  p.append(el('h3', null, 'Version history'));
+
+  const body = el('div', 'body');
+
+  const bar = el('div', 'planrow');
+  const btn = el('button', 'primary', 'Download all blobs');
+  const note = el('span', 'hint');
+  bar.append(btn, note);
+  body.append(bar);
+
+  const list = el('div', 'vhist');
+  body.append(list);
+  p.append(body);
+
+  btn.onclick = async () => {
+    btn.disabled = true;
+    try { await api.post(`/api/depots/${depotId}/blobs`); } catch { /* status line shows it */ }
+    pollHistory(depotId, true);
+  };
+
+  state.history = { depotId, list, btn, note, open: new Set() };
+  pollHistory(depotId, false);
+  return p;
+}
+
+async function pollHistory(depotId, keepPolling) {
+  const h = state.history;
+  if (!h || h.depotId !== depotId) return;
+
+  let r;
+  try { r = await api.get(`/api/depots/${depotId}/versions`); } catch { return; }
+  if (!state.history || state.history.depotId !== depotId) return;
+
+  const missing = r.versions.filter((v) => !v.local).length;
+  h.btn.disabled = r.fetch.running || missing === 0;
+  h.btn.textContent = missing === 0 ? 'All blobs downloaded' : `Download all blobs (${num(missing)})`;
+
+  h.note.textContent = r.fetch.running
+    ? `${num(r.fetch.done)} / ${num(r.fetch.total)} blobs…`
+    : (r.fetch.message || 'blobs are kilobytes — the whole history costs a few MB');
+
+  renderHistory(depotId, r.versions);
+
+  if (r.fetch.running || keepPolling) {
+    setTimeout(() => pollHistory(depotId, r.fetch.running), 1000);
+  }
+}
+
+function renderHistory(depotId, versions) {
+  const h = state.history;
+  const list = h.list;
+
+  // Rebuild only when the shape changed, so an open section is not collapsed under the user.
+  const sig = versions.map((v) => `${v.version}/${v.crc}/${v.local ? v.changedCount : 'x'}`).join('|');
+  if (list.dataset.sig === sig) return;
+  list.dataset.sig = sig;
+
+  list.innerHTML = '';
+
+  for (const v of versions) {
+    const key = `${v.version}/${v.crc}`;
+    const d = el('details', 'vitem');
+    if (h.open.has(key)) d.open = true;
+
+    const sm = el('summary');
+    sm.append(el('b', 'vver', 'v' + v.version));
+    sm.append(el('span', 'vdate', v.date ? v.date.slice(0, 10) : '—'));
+
+    if (v.error) {
+      sm.append(el('span', 'vwhat bad', v.error.slice(0, 60)));
+    } else if (!v.local) {
+      sm.append(el('span', 'vwhat dim', 'blob not downloaded'));
+    } else if (v.wholeSet) {
+      sm.append(el('span', 'vwhat', `${num(v.changedCount)} files · first release`));
+      sm.append(el('span', 'vsize', bytes(v.changedBytes)));
+    } else {
+      sm.append(el('span', 'vwhat', `${num(v.changedCount)} changed`));
+      sm.append(el('span', 'vsize', bytes(v.changedBytes)));
+    }
+
+    sm.append(el('span', 'vcrc', v.crc));
+    d.append(sm);
+
+    const inner = el('div', 'vbody');
+    inner.textContent = '';
+    d.append(inner);
+
+    d.ontoggle = () => {
+      if (!d.open) { h.open.delete(key); return; }
+      h.open.add(key);
+      if (inner.dataset.loaded) return;
+      loadVersionFiles(depotId, v, inner);
+    };
+
+    if (d.open && !inner.dataset.loaded) loadVersionFiles(depotId, v, inner);
+
+    list.append(d);
+  }
+}
+
+async function loadVersionFiles(depotId, v, host) {
+  if (!v.local) {
+    host.innerHTML = '<div class="muted">Download the blobs to see what this version changed.</div>';
+    return;
+  }
+
+  host.innerHTML = '<div class="muted">reading the blob…</div>';
+
+  let r;
+  try {
+    r = await api.get(`/api/depots/${depotId}/versions/${v.version}/files?crc=${encodeURIComponent(v.crc)}`);
+  } catch (e) {
+    host.innerHTML = '';
+    host.append(note('bad', 'Could not read the file list', String(e.message || e)));
+    return;
+  }
+
+  host.innerHTML = '';
+  if (r.error) { host.append(note('bad', 'Cannot list the files', r.error)); return; }
+  if (r.needsFetch) { host.innerHTML = '<div class="muted">blob is not downloaded yet</div>'; return; }
+
+  host.dataset.loaded = '1';
+
+  const filter = el('input');
+  filter.type = 'search';
+  filter.placeholder = 'Filter by path…';
+  filter.className = 'vfilter';
+  host.append(filter);
 
   const wrap = el('div', 'vtable');
   const t = el('table');
-  t.innerHTML = '<thead><tr><th class="num">Ver</th><th>Kind</th><th>CRC</th><th>Date</th><th class="num">Size</th><th>Local</th><th>sha256</th></tr></thead>';
+  t.innerHTML = '<thead><tr><th>Path</th><th class="num">Size</th><th>Packing</th></tr></thead>';
   const tb = el('tbody');
 
-  for (const v of versions) {
-    const rows = [...v.blobs.map((b) => ['blob', b]), ...v.dats.map((d) => ['dat', d])];
-    for (const [kind, f] of rows) {
-      const tr = el('tr');
-      tr.append(el('td', 'num', String(v.version)));
-      tr.append(el('td', null, kind));
-      tr.append(el('td', 'mono', f.crc));
-      tr.append(el('td', null, f.date ?? '—'));
-      tr.append(el('td', 'num', bytes(f.size)));
-      const local = el('td');
-      local.innerHTML = `<span class="dot${f.local ? ' have' : ''}"></span>`;
-      tr.append(local);
-      tr.append(el('td', 'mono', f.sha.slice(0, 16) + '…'));
-      tb.append(tr);
-    }
+  const MODE = { 0: 'stored', 1: 'zlib', 2: 'zlib + AES', 3: 'AES' };
+  for (const f of r.files) {
+    const tr = el('tr');
+    tr.dataset.path = f.path.toLowerCase();
+    tr.append(el('td', 'mono', f.path));
+    tr.append(el('td', 'num', bytes(f.size)));
+    tr.append(el('td', null, MODE[f.mode] ?? String(f.mode)));
+    tb.append(tr);
   }
-
   t.append(tb);
   wrap.append(t);
-  p.append(wrap);
-  return p;
+  host.append(wrap);
+
+  const shown = el('div', 'hint');
+  shown.textContent = `${num(r.files.length)} shown`;
+  host.append(shown);
+
+  let timer;
+  filter.oninput = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      const q = filter.value.trim().toLowerCase();
+      let visible = 0;
+      for (const tr of tb.children) {
+        const hit = !q || tr.dataset.path.includes(q);
+        tr.hidden = !hit;
+        if (hit) visible++;
+      }
+      shown.textContent = `${num(visible)} of ${num(r.files.length)} shown`;
+    }, 120);
+  };
 }
 
 // ---------------- extract ----------------
@@ -763,6 +946,7 @@ $('#openSettings').onclick = () => {
   $('#setBlobStreams').value = s.blobConcurrency ?? 32;
   $('#setDatStreams').value = s.datConcurrency ?? 2;
   $('#setWarmAhead').value = s.warmupLookahead ?? 2;
+  $('#setBigFileMb').value = Math.round((s.bigFileBytes ?? 31457280) / 1048576);
   $('#setVerify').checked = !!s.verifyHashes;
   $('#setFailover').checked = !!s.failover;
   $('#settingsDlg').showModal();
@@ -777,6 +961,7 @@ $('#saveSettings').onclick = async () => {
     blobConcurrency: +$('#setBlobStreams').value,
     datConcurrency: +$('#setDatStreams').value,
     warmupLookahead: +$('#setWarmAhead').value,
+    bigFileMb: +$('#setBigFileMb').value,
     verifyHashes: $('#setVerify').checked,
     failover: $('#setFailover').checked,
   });

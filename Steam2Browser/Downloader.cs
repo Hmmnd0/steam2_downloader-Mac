@@ -138,7 +138,29 @@ public sealed class DownloadManager(ArchiveClient client, Settings settings, Tor
                 // Only the dat phase warms ahead. Blobs are kilobytes and already run 32 at a
                 // time, so there is nothing to hide the latency of.
                 await OnePhaseAsync(job, blobs, "blobs", blobStreams, warmAhead: false, ct);
-                await OnePhaseAsync(job, dats, "dats", datStreams, warmAhead: true, ct);
+
+                // Large dats go last and alone. Two concurrent long sequential reads make
+                // disk-backed storage seek between them; small files finish before that bites,
+                // so they keep the configured parallelism.
+                long bigFrom = settings.BigFileBytes;
+                if (bigFrom > 0)
+                {
+                    // An unknown size is treated as large: better a slower download than a
+                    // multi-gigabyte file competing with another one.
+                    var small = dats.Where(f => f.Size >= 0 && f.Size < bigFrom).ToList();
+                    var big = dats.Where(f => f.Size < 0 || f.Size >= bigFrom).ToList();
+
+                    if (big.Count > 0)
+                        job.Say($"{big.Count} dat(s) at or above {bigFrom / 1048576} MB " +
+                                $"will be fetched one at a time");
+
+                    await OnePhaseAsync(job, small, "small dats", datStreams, warmAhead: true, ct);
+                    await OnePhaseAsync(job, big, "large dats", 1, warmAhead: true, ct);
+                }
+                else
+                {
+                    await OnePhaseAsync(job, dats, "dats", datStreams, warmAhead: true, ct);
+                }
             }
             else
             {

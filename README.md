@@ -8,18 +8,23 @@ Single executable. It starts a local server and opens your browser.
 
 ## Run
 
-Download `steam2browser-osx-arm64.zip` or `.dmg` (Apple Silicon) from the
-[latest release](https://github.com/Hmmnd0/steam2_downloader-Mac/releases), unzip (or open the dmg
-and copy `steam2browser` out), and run it. Nothing else to install.
+Download from the [latest release](https://github.com/Hmmnd0/steam2_downloader-Mac/releases)
+(Apple Silicon). Two options:
 
-The binary is unsigned, so macOS Gatekeeper will refuse to open it the first time. Clear the
-quarantine flag once, from Terminal:
+- **`.dmg`** — open it, drag **Steam2 Archive Browser** into Applications, double-click to launch.
+  Opens `http://127.0.0.1:5099` in your browser; no Terminal needed.
+- **`.zip`** — a raw binary, for running from Terminal with flags (see below).
+
+Everything ships unsigned, so macOS Gatekeeper will block the first launch either way. For the
+`.app`: right-click it → **Open** → **Open** again in the dialog (or System Settings → Privacy &
+Security → **Open Anyway**, if Gatekeeper already blocked it once). For the raw binary from the
+zip, clear the quarantine flag once instead:
 
 ```
 xattr -d com.apple.quarantine steam2browser
 ```
 
-Then:
+Then, from Terminal:
 
 ```
 ./steam2browser                   # opens http://127.0.0.1:5099

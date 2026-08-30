@@ -463,7 +463,13 @@ app.MapPost("/api/reveal", (RevealRequest req) =>
         string target = req.Path;
         if (string.IsNullOrWhiteSpace(target)) return Results.BadRequest(new { error = "empty path" });
         if (!Directory.Exists(target) && !File.Exists(target)) Directory.CreateDirectory(target);
-        Process.Start(new ProcessStartInfo("explorer.exe", $"\"{target}\"") { UseShellExecute = true });
+        var psi = OperatingSystem.IsWindows()
+            ? new ProcessStartInfo("explorer.exe", $"\"{target}\"")
+            : OperatingSystem.IsMacOS()
+                ? new ProcessStartInfo("open", $"-R \"{target}\"")
+                : new ProcessStartInfo("xdg-open", $"\"{target}\"");
+        psi.UseShellExecute = true;
+        Process.Start(psi);
         return Results.Ok(new { ok = true });
     }
     catch (Exception ex)

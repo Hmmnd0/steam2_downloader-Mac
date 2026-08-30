@@ -34,12 +34,13 @@ var client = new ArchiveClient(http)
 };
 var loader = new IndexLoader(client, settings);
 var torrent = new TorrentSource(settings);
-var downloads = new DownloadManager(client, settings, torrent);
+// Built before the download manager, which uses it to work out which dats a chain really needs.
+var changes = new ChangeIndex(client, settings);
+var downloads = new DownloadManager(client, settings, torrent, changes);
 var extractor = new ExtractorRunner(settings);
 var updates = new UpdateChecker(http);
 updates.Initialise();
 var labels = new LabelSource(http);
-var changes = new ChangeIndex(client, settings);
 var fileSearch = new FileSearch(settings);
 var names = new NameCache(client, http, labels);
 names.Load(Settings.RootFor(baseDir));
@@ -592,6 +593,45 @@ app.MapGet("/api/file/{dir}/{name}", async (string dir, string name, Cancellatio
 
 Dto.PlanHost = () => client.Primary;
 
+// How much of a chain's dat traffic is actually dead weight. Answered from blobs alone, so it
+// costs nothing but the blobs that browsing the depot already needs.
+app.MapGet("/api/depots/{id:int}/needed", (int id, int version) =>
+{
+    if (loader.Catalog is null) return Results.BadRequest(new { error = "index not loaded yet" });
+
+    var depot = loader.Catalog.Ordered.FirstOrDefault(d => d.Id == id);
+    if (depot is null) return Results.NotFound(new { error = "no such depot" });
+
+    var chainBlobs = depot.Blobs.Where(b => b.Version <= version)
+                                .OrderBy(b => b.Version)
+                                .ToList();
+
+    var target = chainBlobs.LastOrDefault(b => b.Version == version);
+    if (target is null) return Results.NotFound(new { error = "no blob at that version" });
+
+    var needed = changes.NeededDatVersions(chainBlobs, target);
+    if (needed is null)
+        return Results.Ok(new { resolved = false, reason = "not every blob is on disk, or an id is unaccounted for" });
+
+    var datsByVersion = depot.Dats.Where(d => d.Version <= version)
+                                  .GroupBy(d => d.Version)
+                                  .ToDictionary(g => g.Key, g => g.First());
+
+    long full = datsByVersion.Values.Sum(d => Math.Max(0, d.ApproxSize));
+    long slim = needed.Where(datsByVersion.ContainsKey)
+                      .Sum(v => Math.Max(0, datsByVersion[v].ApproxSize));
+
+    return Results.Ok(new
+    {
+        resolved = true,
+        chainVersions = datsByVersion.Count,
+        neededVersions = needed.Count,
+        needed,
+        fullBytes = full,
+        neededBytes = slim,
+    });
+});
+
 app.MapPost("/api/blobs/range", (BlobRangeRequest req) =>
 {
     if (loader.Catalog is null) return Results.BadRequest(new { error = "index not loaded yet" });
@@ -700,6 +740,7 @@ app.MapPost("/api/plan", async (PlanRequest req, CancellationToken ct) =>
     if (cat is null) return Results.BadRequest(new { error = "index not loaded yet" });
 
     var plan = await ChainResolver.ResolveAsync(cat, client, settings.DataDir, req.Depot, req.Version, req.BlobCrc, ct);
+    changes.Prune(plan);
     return Results.Ok(Dto.Plan(plan, settings));
 });
 
@@ -709,6 +750,7 @@ app.MapPost("/api/download", async (PlanRequest req, CancellationToken ct) =>
     if (cat is null) return Results.BadRequest(new { error = "index not loaded yet" });
 
     var plan = await ChainResolver.ResolveAsync(cat, client, settings.DataDir, req.Depot, req.Version, req.BlobCrc, ct);
+    changes.Prune(plan);
     if (plan.Error is not null || plan.NeedsChoice) return Results.Ok(Dto.Plan(plan, settings));
 
     var job = downloads.Start(plan);
@@ -912,6 +954,10 @@ internal static class Dto
         alreadyLocal = p.Files.Count(f =>
             System.IO.File.Exists(Path.Combine(s.DataDir, f.Entry.DirName, f.Entry.FileName))),
         extractArgs = p.ExtractArgs,
+        // Null when it could not be worked out yet, which the UI reports rather than hiding.
+        skippedDats = p.SkippedDats,
+        skippedBytes = p.SkippedBytes,
+        chainDats = p.ChainDats,
         files = p.Files.Take(2000).Select(f => new
         {
             name = f.Entry.FileName,

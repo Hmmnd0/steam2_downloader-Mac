@@ -387,6 +387,103 @@ public sealed class ChangeIndex(ArchiveClient client, Settings settings)
 
     // ---------------- bulk fetch ----------------
 
+    /// <summary>
+    /// Which versions' dats actually hold bytes the target version needs.
+    ///
+    /// A dat carries only the files its version wrote, and the extractor resolves a file by walking
+    /// the chain's file-id tables in order, letting later versions overwrite earlier entries. So a
+    /// version whose every written file was overwritten again before the target contributes nothing
+    /// to it, and its dat can be skipped — the blobs still have to be read, but they are kilobytes.
+    ///
+    /// Returns null when the answer cannot be established: a blob missing from disk, or a file id in
+    /// the target manifest that no table in the chain claims. Pruning on a guess would produce an
+    /// extraction that fails partway through, so an unknown answer means "download everything".
+    /// </summary>
+    public List<int>? NeededDatVersions(IReadOnlyList<Entry> chainBlobs, Entry targetBlob)
+    {
+        if (chainBlobs.Count == 0) return null;
+
+        var owner = new Dictionary<uint, int>();
+
+        foreach (var blob in chainBlobs.OrderBy(b => b.Version))
+        {
+            string path = PathOf(blob);
+            if (!File.Exists(path)) return null;
+
+            try
+            {
+                foreach (uint id in ChecksumTable.Parse(File.ReadAllBytes(path), blob.Version).Keys)
+                    owner[id] = blob.Version;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        string targetPath = PathOf(targetBlob);
+        if (!File.Exists(targetPath)) return null;
+
+        var tree = TryTree(targetPath);
+        if (tree is null) return null;
+
+        var needed = new HashSet<int>();
+
+        foreach (var node in tree.Nodes)
+        {
+            if (node.Flags == 0) continue;
+            if (!owner.TryGetValue(node.FileId, out int v)) return null;
+            needed.Add(v);
+        }
+
+        return [.. needed.OrderBy(v => v)];
+
+        static ManifestFormat.ManifestTree? TryTree(string path)
+        {
+            try { return ManifestFormat.TreeFromBlob(File.ReadAllBytes(path)); }
+            catch { return null; }
+        }
+    }
+
+    /// <summary>
+    /// Removes from a plan the dats that hold nothing the target version reads, so the size quoted
+    /// before the download is the size that will actually be fetched.
+    ///
+    /// Only possible once every blob in the chain is on disk, since the answer comes out of their
+    /// file id tables. When they are not, the plan is left whole and <see cref="ChainPlan.SkippedDats"/>
+    /// stays null — the download prunes again later, after its blob phase, where the answer exists.
+    /// </summary>
+    public void Prune(ChainPlan plan)
+    {
+        var blobs = plan.Files.Where(f => f.Entry.Kind == Kind.Blob).Select(f => f.Entry).ToList();
+        var dats = plan.Files.Where(f => f.Entry.Kind == Kind.Dat).ToList();
+
+        plan.ChainDats = dats.Count;
+        if (blobs.Count == 0 || dats.Count == 0) return;
+
+        var target = blobs
+            .Where(b => b.Version == plan.TargetVersion)
+            .FirstOrDefault(b => plan.BlobCrc is null
+                                 || b.CrcHex.Equals(plan.BlobCrc, StringComparison.OrdinalIgnoreCase));
+        if (target is null) return;
+
+        var needed = NeededDatVersions(blobs, target);
+        if (needed is null) return;
+
+        var keep = needed.ToHashSet();
+        var dropped = dats.Where(f => !keep.Contains(f.Entry.Version)).ToList();
+
+        plan.SkippedDats = dropped.Count;
+        plan.SkippedBytes = dropped.Sum(f => Math.Max(0, f.Size));
+
+        if (dropped.Count == 0) return;
+
+        foreach (var f in dropped) plan.Files.Remove(f);
+
+        plan.TotalBytes = plan.Files.Sum(f => Math.Max(0, f.Size));
+        plan.TotalExact = plan.Files.Where(f => f.Entry.Kind == Kind.Dat).All(f => f.SizeExact);
+    }
+
     /// <summary>True when this blob is already on disk.</summary>
     public bool HasLocal(Entry blob) => File.Exists(PathOf(blob));
 

@@ -49,7 +49,7 @@ public sealed class DownloadJob
     }
 }
 
-public sealed class DownloadManager(ArchiveClient client, Settings settings, TorrentSource torrent)
+public sealed class DownloadManager(ArchiveClient client, Settings settings, TorrentSource torrent, ChangeIndex changes)
 {
     private readonly ConcurrentDictionary<string, DownloadJob> _jobs = new();
     private int _seq;
@@ -139,6 +139,12 @@ public sealed class DownloadManager(ArchiveClient client, Settings settings, Tor
                 // time, so there is nothing to hide the latency of.
                 await OnePhaseAsync(job, blobs, "blobs", blobStreams, warmAhead: false, ct);
 
+                // Every blob is on disk now, which is the first moment the question can be answered:
+                // a dat whose every written file was overwritten again further up the chain holds
+                // nothing this version reads. For a depot where one binary churns and the rest sits
+                // still, that is almost the entire chain.
+                dats = PruneDats(job, blobs, dats);
+
                 // Large dats go last and alone. Two concurrent long sequential reads make
                 // disk-backed storage seek between them; small files finish before that bites,
                 // so they keep the configured parallelism.
@@ -194,6 +200,39 @@ public sealed class DownloadManager(ArchiveClient client, Settings settings, Tor
     }
 
     /// <summary>Runs one kind of file to completion before the caller moves on to the next phase.</summary>
+    /// <summary>
+    /// Drops the dats no file in the target version resolves to. Answered from the blobs just
+    /// downloaded, so it costs nothing; returns the list untouched whenever the answer cannot be
+    /// established, because skipping a dat that is genuinely needed breaks the extraction.
+    /// </summary>
+    private List<PlanFile> PruneDats(DownloadJob job, List<PlanFile> blobs, List<PlanFile> dats)
+    {
+        var chainBlobs = blobs.Select(f => f.Entry).ToList();
+
+        var target = chainBlobs
+            .Where(b => b.Version == job.Version)
+            .FirstOrDefault(b => job.BlobCrc is null
+                                 || b.CrcHex.Equals(job.BlobCrc, StringComparison.OrdinalIgnoreCase));
+
+        if (target is null) return dats;
+
+        var needed = changes.NeededDatVersions(chainBlobs, target);
+        if (needed is null) return dats;
+
+        var keep = needed.ToHashSet();
+        var kept = dats.Where(f => keep.Contains(f.Entry.Version)).ToList();
+        int dropped = dats.Count - kept.Count;
+
+        if (dropped == 0) return dats;
+
+        long saved = dats.Where(f => !keep.Contains(f.Entry.Version)).Sum(f => Math.Max(0, f.Size));
+        job.Say($"{dropped} of {dats.Count} dat(s) hold nothing version {job.Version} reads — "
+                + $"skipping them saves {saved / 1_000_000} MB");
+
+        job.TotalFiles -= dropped;
+        return kept;
+    }
+
     private async Task OnePhaseAsync(
         DownloadJob job, List<PlanFile> files, string what, int streams, bool warmAhead, CancellationToken ct)
     {

@@ -546,7 +546,60 @@ function planPanel(s) {
 
     sizeInfo.textContent = parts.join('  ·  ');
     sizeInfo.title = `chain v0…v${target}: ${bytes(total)} total`;
+
+    refineSize(s.id, target);
   };
+
+  // The figure above counts the whole chain, which is what a delta format costs at worst. The real
+  // cost is usually lower: a dat whose every written file was overwritten again before the target
+  // holds nothing it reads. That is only answerable from the blobs, so it is asked for separately
+  // and folded in when it arrives rather than holding up the first number.
+  let sizeToken = 0;
+
+  async function refineSize(depot, target) {
+    const mine = ++sizeToken;
+
+    let r;
+    try { r = await api.get(`/api/depots/${depot}/needed?version=${target}`); }
+    catch { return; }
+
+    // The version changed while this was in flight, so the answer is to the wrong question.
+    if (mine !== sizeToken || !r.resolved) return;
+
+    const keep = new Set(r.needed);
+    let total = 0, have = 0, files = 0, unknown = 0;
+
+    for (const entry of state.detail.versions) {
+      if (entry.version > target) continue;
+
+      // Every blob is needed — the file id table is built from all of them — but only the dats
+      // that some file actually resolves to.
+      const wanted = [...entry.blobs, ...(keep.has(entry.version) ? entry.dats : [])];
+
+      for (const f of wanted) {
+        files++;
+        if (f.size >= 0) {
+          total += f.size;
+          if (f.local) have += f.size;
+        } else {
+          unknown++;
+        }
+      }
+    }
+
+    const skipped = r.chainVersions - r.neededVersions;
+    const left = Math.max(0, total - have);
+
+    const parts = [`${unknown ? '≥' : '~'}${bytes(left)} to download`];
+    if (have > 0) parts.push(`${bytes(have)} already here`);
+    parts.push(`${num(files)} files`);
+    if (skipped > 0) parts.push(`${num(skipped)} of ${num(r.chainVersions)} dats not needed`);
+
+    sizeInfo.textContent = parts.join('  ·  ');
+    sizeInfo.title = skipped > 0
+      ? `only versions ${r.needed.join(', ')} carry bytes v${target} reads`
+      : `chain v0…v${target}: every dat is needed`;
+  }
 
   const onVersion = () => { fillCrc(); updateSize(); };
   vSel.onchange = onVersion;
@@ -620,6 +673,17 @@ function renderPlan(plan, out) {
   modeLine.style.marginTop = '12px';
   modeLine.append(el('span', 'tag mode', plan.mode));
   modeLine.append(el('span', null, modeText));
+
+  // Saying what was left out matters as much as the total: a chain that looks suspiciously cheap
+  // should explain itself rather than leave the reader wondering what went missing.
+  if (plan.skippedDats > 0) {
+    modeLine.append(el('span', null,
+      `${num(plan.skippedDats)} of ${num(plan.chainDats)} dats skipped — nothing in v${plan.version} reads them, saving ${bytes(plan.skippedBytes)}`));
+  } else if (plan.skippedDats === null || plan.skippedDats === undefined) {
+    modeLine.append(el('span', null,
+      'download the blobs to find out which dats this version actually reads'));
+  }
+
   out.append(modeLine);
 
   if (plan.blobCrc) {

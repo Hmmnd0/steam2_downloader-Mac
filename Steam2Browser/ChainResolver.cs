@@ -23,6 +23,15 @@ public sealed class ChainPlan
     public bool NeedsChoice;
     public string? Error;
     public string ExtractArgs = "";
+
+    /// <summary>How many dats were left out because nothing in the target version reads them, and
+    /// what that saved. Null when the question could not be answered — see ChangeIndex.Prune.</summary>
+    public int? SkippedDats;
+
+    public long SkippedBytes;
+
+    /// <summary>Dats in the chain before any were skipped, so the UI can say "2 of 57".</summary>
+    public int ChainDats;
 }
 
 public static class ChainResolver

@@ -159,7 +159,10 @@ jobs:
         # resolve would otherwise only show up on a user's machine. Also fires a burst of
         # concurrent requests: an intermittent AccessViolationException under concurrent
         # connections (single-file bundle related, see the Publish step) only ever showed up
-        # under load, never on a single sequential request.
+        # under load, never on a single sequential request. Every curl is capped with -m so a
+        # hung connection bounds itself instead of wedging `wait` (and the job) indefinitely;
+        # timeout-minutes below is a second-layer backstop.
+        timeout-minutes: 5
         run: |
           chmod +x publish/steam2browser
           ./publish/steam2browser --no-browser --port=5099 &
@@ -167,7 +170,7 @@ jobs:
           ok=false
           for i in $(seq 1 30); do
             sleep 2
-            if curl -fsS http://127.0.0.1:5099/ 2>/dev/null | grep -q 'Steam2 Archive'; then
+            if curl -fsS -m 5 http://127.0.0.1:5099/ 2>/dev/null | grep -q 'Steam2 Archive'; then
               ok=true
               break
             fi
@@ -175,9 +178,9 @@ jobs:
           if [ "$ok" = true ]; then
             for round in 1 2 3; do
               for i in $(seq 1 30); do
-                curl -s http://127.0.0.1:5099/ -o /dev/null &
-                curl -s http://127.0.0.1:5099/api/state -o /dev/null &
-                curl -s "http://127.0.0.1:5099/api/depots?take=20" -o /dev/null &
+                curl -s -m 5 http://127.0.0.1:5099/ -o /dev/null &
+                curl -s -m 5 http://127.0.0.1:5099/api/state -o /dev/null &
+                curl -s -m 5 "http://127.0.0.1:5099/api/depots?take=20" -o /dev/null &
               done
               wait
               if ! kill -0 $pid 2>/dev/null; then

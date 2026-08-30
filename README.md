@@ -11,11 +11,14 @@ that out by hand across 58 441 blobs is not practical.
 
 Single self-contained executable for Windows. It starts a local server and opens your browser.
 
+![Steam2 Downloader browsing depot 841 (Portal 2): the depot list, the delta chain planner with its download size estimate, and the version history expanded on v37 to show the four changed files.](assets/img1.png)
+
 ## Install and run
 
-Download `steam2browser-win-x64.zip` from the
-[latest release](https://github.com/extremebleem/steam2_downloader/releases), unzip, run
-`steam2browser.exe`. No .NET install, no dependencies.
+[Download `steam2browser-win-x64.zip`](https://github.com/extremebleem/steam2_downloader/releases/latest/download/steam2browser-win-x64.zip)
+— that link always resolves to the newest build. Unzip and run `steam2browser.exe`. No .NET
+install, no dependencies. Release notes and older builds are on the
+[releases page](https://github.com/extremebleem/steam2_downloader/releases/latest).
 
 ```
 steam2browser.exe                 # opens http://127.0.0.1:5099

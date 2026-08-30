@@ -106,7 +106,7 @@ jobs:
           ok=false
           for i in $(seq 1 30); do
             sleep 2
-            if curl -fsS -m 5 http://127.0.0.1:5099/ 2>/dev/null | grep -q 'Steam2 Archive'; then
+            if curl -fsS -m 5 http://127.0.0.1:5099/ 2>/dev/null | grep -q 'Steam2 Downloader'; then
               ok=true
               break
             fi

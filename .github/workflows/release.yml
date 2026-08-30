@@ -160,8 +160,13 @@ jobs:
         # concurrent requests: an intermittent AccessViolationException under concurrent
         # connections (single-file bundle related, see the Publish step) only ever showed up
         # under load, never on a single sequential request. Every curl is capped with -m so a
-        # hung connection bounds itself instead of wedging `wait` (and the job) indefinitely;
-        # timeout-minutes below is a second-layer backstop.
+        # hung connection bounds itself; timeout-minutes below is a second-layer backstop.
+        #
+        # Bare `wait` waits for every background job in the shell, not just the curls just
+        # launched — including the still-running server itself, since it's also backgrounded.
+        # That deadlocks (wait never returns because the server never exits, and the server is
+        # only killed after wait returns) so each round's curl PIDs are tracked and waited on
+        # explicitly instead.
         timeout-minutes: 5
         run: |
           chmod +x publish/steam2browser
@@ -177,12 +182,13 @@ jobs:
           done
           if [ "$ok" = true ]; then
             for round in 1 2 3; do
+              curl_pids=()
               for i in $(seq 1 30); do
-                curl -s -m 5 http://127.0.0.1:5099/ -o /dev/null &
-                curl -s -m 5 http://127.0.0.1:5099/api/state -o /dev/null &
-                curl -s -m 5 "http://127.0.0.1:5099/api/depots?take=20" -o /dev/null &
+                curl -s -m 5 http://127.0.0.1:5099/ -o /dev/null & curl_pids+=($!)
+                curl -s -m 5 http://127.0.0.1:5099/api/state -o /dev/null & curl_pids+=($!)
+                curl -s -m 5 "http://127.0.0.1:5099/api/depots?take=20" -o /dev/null & curl_pids+=($!)
               done
-              wait
+              wait "${curl_pids[@]}"
               if ! kill -0 $pid 2>/dev/null; then
                 ok=false
                 echo "binary crashed under concurrent load (round $round)" >&2

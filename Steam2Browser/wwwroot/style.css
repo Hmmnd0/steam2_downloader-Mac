@@ -56,15 +56,8 @@ em { color: #fff; font-style: normal; font-weight: 600; }
 }
 
 .brand { display: flex; align-items: center; gap: 11px; min-width: 220px; }
-.brand h1 { font-size: 14px; letter-spacing: .4px; color: #fff; text-transform: uppercase; }
+.brand h1 { font-size: 15px; letter-spacing: .3px; color: #fff; }
 .brand p { margin: 1px 0 0; font-size: 11px; color: var(--dim); }
-
-.mark {
-  width: 26px; height: 26px; border-radius: 2px;
-  background: linear-gradient(135deg, var(--accent) 0%, #1a3f5c 100%);
-  box-shadow: 0 0 0 1px #ffffff1f inset, 0 0 10px #66c0f433;
-  flex: none;
-}
 
 .stats { display: flex; gap: 20px; flex: 1; overflow: hidden; }
 .stats div { display: flex; flex-direction: column; line-height: 1.25; }
@@ -310,7 +303,23 @@ td.mono { font-family: var(--mono); font-size: 11px; color: var(--dim); }
 .vitem .vwhat { color: var(--accent); flex: 1; }
 .vitem .vwhat.dim { color: var(--dimmer); }
 .vitem .vwhat.bad { color: var(--bad); }
-.vitem .vsize { color: var(--dim); font-variant-numeric: tabular-nums; }
+.vitem .vsize { color: var(--dim); font-variant-numeric: tabular-nums; min-width: 72px; text-align: right; }
+.vitem .vdelta { font-variant-numeric: tabular-nums; min-width: 78px; text-align: right; color: var(--dimmer); }
+.vitem .vdelta.up { color: var(--good); }
+.vitem .vdelta.down { color: var(--warn); }
+
+/* Change badges, so new / changed / removed read at a glance in a long list. */
+.chg {
+  display: inline-block; min-width: 58px; text-align: center;
+  font-size: 10px; text-transform: uppercase; letter-spacing: .6px;
+  padding: 1px 6px; border-radius: 2px;
+}
+.chg.new { background: #2c4a12; color: #a4d007; }
+.chg.changed { background: #1a3f5c; color: var(--accent); }
+.chg.removed { background: #4a1f16; color: #ef7d63; }
+
+td.delta.up { color: var(--good); }
+td.delta.down { color: var(--warn); }
 .vitem .vcrc { color: var(--dimmer); font-family: var(--mono); font-size: 11px; }
 
 .vbody { padding: 4px 10px 12px; background: #16202d; }

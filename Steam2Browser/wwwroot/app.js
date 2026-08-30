@@ -33,6 +33,8 @@ function bytes(n) {
   return `${v < 10 && i > 0 ? v.toFixed(2) : v < 100 ? v.toFixed(1) : Math.round(v)} ${u[i]}`;
 }
 const rate = (bps) => (!bps || bps <= 0 ? '—' : bytes(bps) + '/s');
+// Size change, with the sign kept: a diff is only readable if growth and shrinkage look different.
+const signed = (n) => (!n ? '±0' : (n > 0 ? '+' : '−') + bytes(Math.abs(n)));
 const num = (n) => (n ?? 0).toLocaleString('en-US');
 
 // ---------------- state ----------------
@@ -626,6 +628,11 @@ function renderHistory(depotId, versions) {
 
   list.innerHTML = '';
 
+  // "First release" means the earliest version and nothing else. It is not the same as a version
+  // whose dat happens to hold every file it has — that is true whenever everything was rewritten,
+  // and it was labelling late versions of small depots as the first one.
+  const earliest = Math.min(...versions.map((v) => v.version));
+
   for (const v of versions) {
     const key = `${v.version}/${v.crc}`;
     const d = el('details', 'vitem');
@@ -639,12 +646,25 @@ function renderHistory(depotId, versions) {
       sm.append(el('span', 'vwhat bad', v.error.slice(0, 60)));
     } else if (!v.local) {
       sm.append(el('span', 'vwhat dim', 'blob not downloaded'));
-    } else if (v.wholeSet) {
-      sm.append(el('span', 'vwhat', `${num(v.changedCount)} files · first release`));
-      sm.append(el('span', 'vsize', bytes(v.changedBytes)));
+    } else if (v.version === earliest) {
+      sm.append(el('span', 'vwhat', `${num(v.addedCount)} files · first release`));
+      sm.append(el('span', 'vdelta up', signed(v.deltaBytes)));
+      sm.append(el('span', 'vsize', bytes(v.payloadBytes)));
+    } else if (v.unclassified) {
+      // Without the previous version's blob there is no way to tell a new file from a rewritten one.
+      sm.append(el('span', 'vwhat dim',
+        `${num(v.changedCount)} in this version · fetch v${v.version - 1} to split new from changed`));
+      sm.append(el('span', 'vsize', bytes(v.payloadBytes)));
     } else {
-      sm.append(el('span', 'vwhat', `${num(v.changedCount)} changed`));
-      sm.append(el('span', 'vsize', bytes(v.changedBytes)));
+      const bits = [];
+      if (v.addedCount) bits.push(`${num(v.addedCount)} new`);
+      if (v.changedCount) bits.push(`${num(v.changedCount)} changed`);
+      if (v.removedCount) bits.push(`${num(v.removedCount)} removed`);
+
+      sm.append(el('span', 'vwhat', bits.join(' · ') || 'nothing changed'));
+      sm.append(el('span', 'vdelta ' + (v.deltaBytes > 0 ? 'up' : v.deltaBytes < 0 ? 'down' : ''),
+        signed(v.deltaBytes)));
+      sm.append(el('span', 'vsize', bytes(v.payloadBytes)));
     }
 
     sm.append(el('span', 'vcrc', v.crc));
@@ -698,16 +718,27 @@ async function loadVersionFiles(depotId, v, host) {
 
   const wrap = el('div', 'vtable');
   const t = el('table');
-  t.innerHTML = '<thead><tr><th>Path</th><th class="num">Size</th><th>Packing</th></tr></thead>';
+  t.innerHTML = '<thead><tr><th></th><th>Path</th><th class="num">Size</th>'
+              + '<th class="num">Change</th><th>Packing</th></tr></thead>';
   const tb = el('tbody');
 
   const MODE = { 0: 'stored', 1: 'zlib', 2: 'zlib + AES', 3: 'AES' };
   for (const f of r.files) {
     const tr = el('tr');
     tr.dataset.path = f.path.toLowerCase();
+
+    const badge = el('td');
+    badge.append(el('span', 'chg ' + f.change, f.change));
+    tr.append(badge);
+
     tr.append(el('td', 'mono', f.path));
-    tr.append(el('td', 'num', bytes(f.size)));
-    tr.append(el('td', null, MODE[f.mode] ?? String(f.mode)));
+    tr.append(el('td', 'num', f.change === 'removed' ? '—' : bytes(f.size)));
+
+    const d = el('td', 'num delta ' + (f.delta > 0 ? 'up' : f.delta < 0 ? 'down' : ''));
+    d.textContent = f.change === 'changed' && f.delta === 0 ? 'same size' : signed(f.delta);
+    tr.append(d);
+
+    tr.append(el('td', null, f.change === 'removed' ? '—' : (MODE[f.mode] ?? String(f.mode))));
     tb.append(tr);
   }
   t.append(tb);

@@ -2,7 +2,7 @@ namespace Steam2Browser;
 
 public sealed class LoadStatus
 {
-    public string Phase = "idle";      // idle | index | parse | sizes | ready | error
+    public string Phase = "loading...";      // loading | index | parse | sizes | ready | error
     public string Message = "";
     public double Percent;
     public bool Ready;
@@ -87,7 +87,7 @@ public sealed class IndexLoader(ArchiveClient client, Settings settings)
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            Status.Phase = "idle";
+            Status.Phase = "loading...";
             Status.Message = "cancelled";
         }
         catch (Exception ex)

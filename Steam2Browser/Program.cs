@@ -482,7 +482,8 @@ app.MapGet("/api/depots/{id:int}/versions", (int id) =>
         versions = changes.Summary(depot).Select(v => new
         {
             v.Version, v.Crc, v.Date, v.Local,
-            v.ChangedCount, v.ChangedBytes, v.FilesInVersion, v.WholeSet, v.Error,
+            v.AddedCount, v.ChangedCount, v.RemovedCount,
+            v.PayloadBytes, v.DeltaBytes, v.FilesInVersion, v.Unclassified, v.Error,
         }),
     });
 });
@@ -502,15 +503,25 @@ app.MapGet("/api/depots/{id:int}/versions/{version:int}/files", (int id, int ver
 
     try
     {
-        var files = changes.FilesFor(blob);
-        if (files is null) return Results.Ok(new { needsFetch = true, crc = blob.CrcHex });
+        var result = changes.Diff(depot, blob);
+        if (result is null) return Results.Ok(new { needsFetch = true, crc = blob.CrcHex });
+
+        var (files, unclassified) = result.Value;
 
         return Results.Ok(new
         {
             version,
             crc = blob.CrcHex,
             count = files.Count,
-            files = files.Take(20000).Select(f => new { path = f.Path, size = f.Size, mode = f.Mode }),
+            unclassified,
+            files = files.Take(20000).Select(f => new
+            {
+                path = f.Path,
+                size = f.Size,
+                delta = f.Delta,
+                mode = f.Mode,
+                change = f.Change,
+            }),
         });
     }
     catch (Exception ex)

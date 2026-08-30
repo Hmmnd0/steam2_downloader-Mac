@@ -73,12 +73,22 @@ cd Steam2Browser
 dotnet run
 ```
 
-Release build:
+Release build (Windows):
 
 ```
 dotnet publish Steam2Browser/Steam2Browser.csproj -c Release -r win-x64 --self-contained true \
   -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true -o out
 ```
+
+Release build (macOS, Apple Silicon):
+
+```
+dotnet publish Steam2Browser/Steam2Browser.csproj -c Release -r osx-arm64 --self-contained true \
+  -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true -o out
+```
+
+For an Intel Mac, use `-r osx-x64` instead. The `-r` flag overrides the `win-x64` default baked
+into the `.csproj`. CI builds and releases both `win-x64` and `osx-arm64` on every push to `main`.
 
 ## Credits
 

@@ -30,7 +30,7 @@ public static class Mirrors
     /// <summary>
     /// The three HTTP mirrors serve byte-identical content (same ETag / Content-Length /
     /// Last-Modified). Schemes differ and are not interchangeable: de answers only on https, ro and
-    /// us only on http. The fourth entry is the BitTorrent swarm, which carries the same 12.11 TiB.
+    /// us only on http. The fourth entry is the BitTorrent swarm, which carries the same 13.32 TB.
     /// </summary>
     public static readonly Mirror[] All =
     [
@@ -47,11 +47,11 @@ public static class Mirrors
     private const string ProbePath =
         "dats/0_0_65e371a6_c84cc42ee2cf40687201018166353dc6a841d1d337bfdef2f989ca0e79ead0cf.dat";
 
-    private const int ProbeBytes = 4 * 1024 * 1024;
+    private const int ProbeBytes = 4_000_000;
 
     /// <summary>
     /// The probe stops at whichever comes first, the byte cap or this. Without it a mirror running at
-    /// 45 KiB/s would hold the whole race — and everything queued behind it — for over a minute.
+    /// 45 KB/s would hold the whole race — and everything queued behind it — for over a minute.
     /// </summary>
     private static readonly TimeSpan ProbeWindow = TimeSpan.FromSeconds(6);
 

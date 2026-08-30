@@ -151,7 +151,7 @@ public sealed class DownloadManager(ArchiveClient client, Settings settings, Tor
                     var big = dats.Where(f => f.Size < 0 || f.Size >= bigFrom).ToList();
 
                     if (big.Count > 0)
-                        job.Say($"{big.Count} dat(s) at or above {bigFrom / 1048576} MB " +
+                        job.Say($"{big.Count} dat(s) at or above {bigFrom / 1_000_000} MB " +
                                 $"will be fetched one at a time");
 
                     await OnePhaseAsync(job, small, "small dats", datStreams, warmAhead: true, ct);

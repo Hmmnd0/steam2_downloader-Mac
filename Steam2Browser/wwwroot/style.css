@@ -39,6 +39,12 @@ html, body {
   overflow: hidden;
 }
 
+/* A flex column instead of subtracting heights by hand. The old layout computed its height from
+   a --act variable set on .activity, which is a sibling — so it never saw it and always used the
+   230px fallback, leaving a gap once the panel could collapse. */
+body { display: flex; flex-direction: column; }
+.topbar, #loadBar, .activity { flex: none; }
+
 button, input, select { font: inherit; color: inherit; }
 h1, h2, h3 { margin: 0; font-weight: 400; }
 em { color: #fff; font-style: normal; font-weight: 600; }
@@ -55,14 +61,35 @@ em { color: #fff; font-style: normal; font-weight: 600; }
   box-shadow: 0 1px 0 #ffffff0d inset;
 }
 
+/* The name reads as a wordmark while nothing is happening. When there is a status worth showing
+   the status line expands under it, which shrinks the name and lifts it back to the position it
+   used to sit in — the movement itself is the signal that work started. */
 .brand { display: flex; align-items: center; gap: 11px; min-width: 220px; }
-.brand h1 { font-size: 15px; letter-spacing: .3px; color: #fff; }
-.brand p { margin: 1px 0 0; font-size: 11px; color: var(--dim); }
+.brand h1 {
+  font-size: 19px; font-weight: 700; letter-spacing: .2px; color: #fff;
+  transition: font-size .22s ease;
+}
+.brand.busy h1 { font-size: 15px; }
+.brand p {
+  margin: 0; font-size: 11px; color: var(--dim);
+  max-height: 0; opacity: 0; overflow: hidden;
+  transition: max-height .22s ease, opacity .22s ease, margin .22s ease;
+}
+.brand.busy p { max-height: 16px; opacity: 1; margin-top: 2px; }
 
-.stats { display: flex; gap: 20px; flex: 1; overflow: hidden; }
+/* Sits where the badges used to. A link, so it looks like one, but quiet enough not to compete
+   with the depot name beside it. */
+.sdb {
+  font-size: 11px; color: var(--accent); text-decoration: none;
+  border: 1px solid var(--line-2); border-radius: var(--radius);
+  padding: 3px 8px; white-space: nowrap;
+}
+.sdb:hover { color: #fff; border-color: var(--accent); background: var(--bg-3); }
+
+.stats { display: flex; gap: 13px; flex: 1; overflow: hidden; }
 .stats div { display: flex; flex-direction: column; line-height: 1.25; }
-.stats b { font-size: 13px; font-weight: 400; color: #fff; font-variant-numeric: tabular-nums; }
-.stats span { font-size: 10px; color: var(--dimmer); text-transform: uppercase; letter-spacing: .8px; }
+.stats b { font-size: 12px; font-weight: 400; color: #fff; font-variant-numeric: tabular-nums; }
+.stats span { font-size: 9px; color: var(--dimmer); text-transform: uppercase; letter-spacing: .5px; white-space: nowrap; }
 
 /* A counter that is still filling in pulses, so a growing number reads as work in progress. */
 @keyframes statBusy {
@@ -75,6 +102,21 @@ em { color: #fff; font-style: normal; font-weight: 600; }
 @media (prefers-reduced-motion: reduce) {
   .stats div.busy b { animation: none; }
 }
+
+.filesearch { display: flex; flex-direction: column; gap: 2px; min-width: 300px; }
+.filesearch input { width: 100%; }
+.filesearch .hint { font-size: 10px; }
+
+/* Global file-search results, shown in place of a depot page. */
+.fhits { margin-top: 10px; }
+.fhit {
+  padding: 5px 10px 5px 24px; border-bottom: 1px solid #0d1620; cursor: pointer;
+  border-left: 3px solid transparent;
+}
+.fhit:hover { background: #22354a; border-left-color: var(--accent); }
+.fhit .fdepot { color: #fff; font-variant-numeric: tabular-nums; }
+.fhit .fname { color: var(--dim); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fhit .fpath { font-family: var(--mono); font-size: 11px; color: var(--accent); word-break: break-all; }
 
 .mirror { display: flex; align-items: center; gap: 7px; }
 .mirror label { font-size: 10px; color: var(--dimmer); text-transform: uppercase; letter-spacing: .8px; }
@@ -135,12 +177,31 @@ button:disabled { opacity: .4; cursor: default; }
   transition: width .3s;
 }
 
+/* A phase with no percentage to report: a stripe that keeps moving says "working" where a bar
+   frozen at zero says nothing. */
+#loadBar.indeterminate i {
+  width: 28%;
+  transition: none;
+  animation: loadSlide 1.15s ease-in-out infinite;
+}
+@keyframes loadSlide {
+  0%   { margin-left: -28%; }
+  100% { margin-left: 100%; }
+}
+
+/* Locked while the index loads: still readable, plainly not clickable. */
+button:disabled, input:disabled, select:disabled {
+  opacity: .45;
+  cursor: default;
+}
+.chips.locked { opacity: .45; pointer-events: none; }
+
 /* ---------- layout ---------- */
 
 .layout {
   display: grid;
   grid-template-columns: 330px 1fr;
-  height: calc(100vh - 47px - 2px - var(--act, 230px));
+  flex: 1;
   min-height: 0;
 }
 
@@ -155,6 +216,14 @@ button:disabled { opacity: .4; cursor: default; }
 .toolbar input { flex: 1; min-width: 0; }
 
 .chips { display: flex; flex-wrap: wrap; gap: 5px; padding: 0 10px 8px; }
+
+/* Sort belongs with the list, not with the search box it used to be mistaken for. */
+.sortrow { display: flex; align-items: center; gap: 6px; padding: 0 10px 9px; }
+.sortrow label {
+  font-size: 10px; color: var(--dimmer);
+  text-transform: uppercase; letter-spacing: .8px;
+}
+.sortrow select { flex: 1; min-width: 0; }
 .chips button {
   font-size: 11px; padding: 3px 9px;
   background: #2a3f5a66; color: var(--dim);
@@ -190,9 +259,9 @@ button:disabled { opacity: .4; cursor: default; }
   border-left-color: var(--accent);
 }
 .depot .id { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
-.depot .id b { font-weight: 400; color: #fff; font-variant-numeric: tabular-nums; flex: none; }
+.depot .id b { font-weight: 400; color: var(--dim); font-variant-numeric: tabular-nums; flex: none; }
 .depot .dname {
-  color: var(--dim); font-size: 12px;
+  color: #fff; font-size: 12px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .depot .sz { color: var(--dim); font-variant-numeric: tabular-nums; font-size: 12px; }
@@ -278,6 +347,17 @@ td.mono { font-family: var(--mono); font-size: 11px; color: var(--dim); }
 
 .vhist { margin-top: 12px; border-top: 1px solid #000; }
 
+.vbranch {
+  display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+  padding: 9px 10px; background: var(--chrome);
+  border-top: 1px solid #000; border-bottom: 1px solid #000;
+  font-size: 11px; color: var(--dimmer);
+}
+.vbranch b {
+  color: var(--accent); font-weight: 400;
+  text-transform: uppercase; letter-spacing: .8px;
+}
+
 .vitem { border-bottom: 1px solid #0d1620; }
 .vitem > summary {
   display: flex; align-items: center; gap: 12px;
@@ -322,38 +402,50 @@ td.delta.up { color: var(--good); }
 td.delta.down { color: var(--warn); }
 .vitem .vcrc { color: var(--dimmer); font-family: var(--mono); font-size: 11px; }
 
+/* Quiet by design: a save link should not compete with the diff counts next to it. */
+.vitem .vget {
+  color: var(--dimmer); text-decoration: none;
+  font-size: 10px; text-transform: uppercase; letter-spacing: .6px;
+  padding: 1px 6px; border: 1px solid #2a3f5a; border-radius: 2px;
+}
+.vitem .vget:hover { color: var(--accent); border-color: var(--accent); }
+
 .vbody { padding: 4px 10px 12px; background: #16202d; }
 .vfilter { width: 100%; margin: 6px 0 8px; }
 
 @media (prefers-reduced-motion: reduce) {
   .vitem > summary::before { transition: none; }
+  .activity { transition: none; }
 }
 
 /* ---------- activity ---------- */
 
 .activity {
-  height: var(--act, 230px);
+  height: 230px;
+  transition: height .18s ease;
   display: flex; flex-direction: column;
   border-top: 1px solid #000;
   background: var(--bg-1);
   min-height: 0;
 }
-.activity.min { --act: 34px; }
+.activity.min { height: 34px; }
 
 .acttabs {
   display: flex; align-items: center; gap: 4px;
   padding: 4px 8px; background: var(--chrome);
   border-bottom: 1px solid #000;
 }
-.acttabs button { background: transparent; color: var(--dim); font-size: 12px; text-transform: uppercase; letter-spacing: .6px; }
-.acttabs button.on { background: var(--bg-3); color: #fff; }
+.acttabs button { background: transparent; color: var(--dim); font-size: 12px; }
+.acttitle {
+  color: var(--dim); font-size: 12px;
+  text-transform: uppercase; letter-spacing: .8px; padding: 0 4px;
+}
 .acttabs .right { margin-left: auto; }
 .acttabs b { font-variant-numeric: tabular-nums; color: var(--accent); font-weight: 400; }
 
 .actbody { flex: 1; overflow-y: auto; min-height: 0; }
 .activity.min .actbody { display: none; }
-.tabpane { display: none; padding: 10px 12px; }
-.tabpane.on { display: block; }
+#actList { padding: 10px 12px; }
 
 .job {
   border: 1px solid #000; border-radius: var(--radius);
@@ -420,3 +512,29 @@ dialog menu { display: flex; justify-content: flex-end; gap: 8px; margin: 0; pad
 ::-webkit-scrollbar-track { background: #0d1620; }
 ::-webkit-scrollbar-thumb { background: linear-gradient(to bottom, #4a6a90, #2a3f5a); border-radius: 0; }
 ::-webkit-scrollbar-thumb:hover { background: linear-gradient(to bottom, #5c7fa8, #35506f); }
+
+/* Sits at the end of the stat strip: archive-wide work, so it belongs with the archive-wide
+   numbers rather than in a depot panel. */
+.statbtn { font-size: 11px; padding: 5px 9px; white-space: nowrap; align-self: center; }
+
+.rangeprog { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
+.rangeprog .bar { height: 5px; border-radius: 3px; background: var(--line); overflow: hidden; }
+.rangeprog .bar i { display: block; height: 100%; width: 0; background: var(--accent);
+                    transition: width .25s ease; }
+
+/* One heading per depot, with that depot's matching paths listed beneath it. */
+.fgroup { margin-bottom: 6px; }
+.fghead {
+  display: flex; align-items: baseline; gap: 10px;
+  padding: 7px 10px; cursor: pointer;
+  background: var(--bg-2); border-bottom: 1px solid var(--line);
+  position: sticky; top: 0; z-index: 1;
+}
+.fghead:hover { background: #22354a; }
+.fghead .fdepot { font-weight: 400; color: #fff; font-variant-numeric: tabular-nums; }
+.fghead .fname { flex: 1; min-width: 0; color: var(--dim); font-size: 12px;
+                 overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fghead .fcount { color: var(--dimmer); font-size: 11px; white-space: nowrap; }
+
+/* The reindex button belongs inside its warning, not floating beside it. */
+.note button { margin-top: 8px; }

@@ -67,22 +67,48 @@ jobs:
 
       - name: Smoke test
         shell: pwsh
-        # Catches a build that publishes but cannot start — the embedded UI failing to
-        # resolve would otherwise only show up on a user's machine.
+        # Catches a build that publishes but cannot start — the embedded UI failing to resolve
+        # would otherwise only show up on a user's machine. The checks are structural on purpose:
+        # an earlier version matched the window title and broke the moment the app was renamed.
         run: |
           $exe = Start-Process -FilePath publish/steam2browser.exe `
             -ArgumentList '--no-browser','--port=5099' -PassThru
-          $ok = $false
+
+          $page = $null
           foreach ($i in 1..30) {
             Start-Sleep -Seconds 2
             try {
               $r = Invoke-WebRequest -Uri http://127.0.0.1:5099/ -TimeoutSec 5 -UseBasicParsing
-              if ($r.StatusCode -eq 200 -and $r.Content -match 'Steam2 Archive') { $ok = $true; break }
+              if ($r.StatusCode -eq 200) { $page = $r.Content; break }
             } catch { }
           }
+
+          $problems = @()
+          if (-not $page) {
+            $problems += 'the exe never answered on port 5099'
+          } else {
+            # The depot list and the script tag are the app, whatever it is called this week.
+            if ($page -notmatch 'id="depotList"') { $problems += 'the page has no depot list' }
+            if ($page -notmatch 'app\.js')        { $problems += 'the page does not load app.js' }
+
+            # Assets are embedded resources in a single-file publish, which is the part most
+            # likely to break without anyone noticing until launch.
+            foreach ($asset in 'style.css', 'app.js') {
+              try {
+                $a = Invoke-WebRequest -Uri "http://127.0.0.1:5099/$asset" -TimeoutSec 5 -UseBasicParsing
+                if ($a.StatusCode -ne 200 -or $a.RawContentLength -lt 100) {
+                  $problems += "$asset came back empty or missing"
+                }
+              } catch {
+                $problems += "$asset did not load"
+              }
+            }
+          }
+
           Stop-Process -Id $exe.Id -Force -ErrorAction SilentlyContinue
-          if (-not $ok) { throw 'the published exe did not serve its UI' }
-          Write-Host 'served the UI'
+
+          if ($problems.Count) { throw ($problems -join '; ') }
+          Write-Host 'served the page, style.css and app.js'
 
       - name: Package
         shell: pwsh

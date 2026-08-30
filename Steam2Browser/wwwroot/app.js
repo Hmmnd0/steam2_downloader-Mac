@@ -25,12 +25,29 @@ const api = {
   },
 };
 
+// Decimal units: a MB is 10^6 bytes. The mirrors quote MiB in their listings and the parser still
+// reads that, but nothing is shown to a reader under a unit name that does not mean what it says.
 function bytes(n) {
   if (n == null || n < 0) return '—';
-  const u = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'];
+  const u = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
   let v = n, i = 0;
-  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  while (v >= 1000 && i < u.length - 1) { v /= 1000; i++; }
   return `${v < 10 && i > 0 ? v.toFixed(2) : v < 100 ? v.toFixed(1) : Math.round(v)} ${u[i]}`;
+}
+
+// Dates arrive as "2003-09-10" or a full timestamp and are rendered in whatever the reader's
+// browser is set to, so a Russian locale gets 10.09.2003 and a US one 9/10/2003.
+//
+// Built from the parts rather than through Date.parse: an ISO date alone is read as UTC midnight,
+// which in any negative-offset timezone formats as the day before.
+function fmtDate(value) {
+  if (!value) return '—';
+
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(value));
+  if (!m) return String(value);
+
+  const d = new Date(+m[1], +m[2] - 1, +m[3]);
+  return Number.isNaN(d.getTime()) ? String(value) : d.toLocaleDateString();
 }
 const rate = (bps) => (!bps || bps <= 0 ? '—' : bytes(bps) + '/s');
 // Size change, with the sign kept: a diff is only readable if growth and shrinkage look different.
@@ -46,6 +63,9 @@ const state = {
     rows: new Map(),      // depot id -> its row elements, so names can be filled in later
     lastNameCount: null,  // how many were named at the last in-place refresh
   },
+  // Activity panel: it follows the work by itself, and a click takes control until the work
+  // state changes again.
+  act: { jobs: false, extract: false, busy: false, manualOpen: null, jobList: [], extractList: [] },
   selected: null,
   detail: null,
   plan: null,
@@ -61,16 +81,60 @@ async function refreshState() {
 
   state.settings = s.settings;
   $('#loadStatus').textContent = s.status.error ? `error: ${s.status.error}` : s.status.message || s.status.phase;
-  $('#loadBar i').style.width = (s.status.phase === 'ready' ? 0 : s.status.percent || 0) + '%';
+  applyLoading(s.status);
+
+// Nothing on this page means anything until the index is in memory: the depot list is empty, the
+// file search has nothing to match against and a blob range has no depot ids to resolve. So the
+// controls that would only disappoint are held shut, and the bar says work is happening.
+//
+// A phase that reports no percentage is not the same as one that is 0% done — an index being
+// fetched cannot say how far along it is. That case gets a moving bar rather than an empty one,
+// which otherwise looks identical to nothing happening at all.
+function applyLoading(status) {
+  const bar = $('#loadBar');
+  const fill = $('#loadBar i');
+  const done = status.phase === 'ready';
+  const known = status.percent > 0;
+
+  bar.classList.toggle('indeterminate', !done && !known);
+  fill.style.width = done ? '0%' : (known ? status.percent + '%' : '');
+
+  // Idle, the name is just a wordmark. A status worth reading pushes it up and shrinks it, so the
+  // header itself shows that something is running without needing a separate indicator.
+  const brand = $('#brand');
+  if (brand) brand.classList.toggle('busy', !done);
+
+  const why = status.error
+    ? `unavailable: ${status.error}`
+    : 'available once the index has loaded';
+
+  for (const sel of ['#blobRange', '#fileSearch', '#depotSearch', '#depotSort', '#depotDir']) {
+    const elm = $(sel);
+    if (!elm) continue;
+
+    elm.disabled = !status.ready;
+    // Keeping the real title back means it returns intact rather than being overwritten.
+    if (!status.ready) {
+      if (elm.dataset.title === undefined) elm.dataset.title = elm.title ?? '';
+      elm.title = why;
+    } else if (elm.dataset.title !== undefined) {
+      elm.title = elm.dataset.title;
+      delete elm.dataset.title;
+    }
+  }
+
+  const chips = $('#depotFilters');
+  if (chips) chips.classList.toggle('locked', !status.ready);
+}
 
   const c = s.catalog;
   if (c) {
     renderStats([
       ['depots', num(c.depots), 'depots', false],
-      ['dats', num(c.dats), 'dats', false],
-      ['blobs', num(c.blobs), 'blobs', false],
-      ['size', c.sizesLoaded ? '~' + bytes(c.totalBytes) : '…', 'archive size', false],
-      ['resets', num(c.resetDepots), 'with resets', false],
+      // Dats and blobs come in pairs, so one cell says as much as two did in half the width.
+      ['files', `${num(c.dats)} / ${num(c.blobs)}`, 'dats / blobs', false],
+      ['size', c.sizesLoaded ? '~' + bytes(c.totalBytes) : '…', 'size', false],
+      ['resets', num(c.resetDepots), 'resets', false],
       ['incomplete', num(c.incompleteDepots), 'incomplete', false],
       // Named counts every source, so it is a share of the whole archive. While a pass is
       // running the label says how much is left rather than restating the same fraction.
@@ -79,7 +143,7 @@ async function refreshState() {
       // Value is what Steam actually recognised. "checked" accumulates across runs while
       // "remaining" is this run's queue, so adding them made a denominator that meant nothing.
       ['steam', num(s.steam.found),
-        s.steam.running ? `asking steam — ${num(s.steam.remaining)} left` : 'named by steam',
+        s.steam.running ? `steam — ${num(s.steam.remaining)} left` : 'via steam',
         s.steam.running],
     ]);
 
@@ -101,11 +165,22 @@ async function refreshState() {
     }
   }
 
+  if (s.fileSearch) {
+    state.fileIndex = s.fileSearch.running
+      ? `indexing ${num(s.fileSearch.depotsIndexed)}/${num(s.fileSearch.depotsToIndex)} depots…`
+      : (s.fileSearch.pathCount ? `${num(s.fileSearch.pathCount)} paths indexed` : '');
+    if (!state.searching) $('#fileSearchNote').textContent = state.fileIndex;
+  }
+
   renderUpdate(s.update);
 
   if (!state.ready && s.status.ready) {
     state.ready = true;
     resetDepots();
+
+    const first = viewFromHash();
+    history.replaceState(first, '', viewUrl(first));
+    if (first.depot != null || first.q) applyView(first);
   }
 }
 
@@ -261,7 +336,7 @@ function depotRow(x) {
   const meta = el('div', 'meta');
   meta.append(el('span', null, `${x.versions} ver`));
   meta.append(el('span', null, `${x.dats + x.blobs} files`));
-  if (x.last) meta.append(el('span', null, x.last));
+  if (x.last) meta.append(el('span', null, fmtDate(x.last)));
   if (x.hasReset) meta.append(el('span', 'tag reset', 'reset'));
   if (!x.complete) meta.append(el('span', 'tag gap', 'gaps'));
   // Only a warning when the depot is genuinely encrypted and no key is known for it —
@@ -276,6 +351,7 @@ function depotRow(x) {
 // ---------------- depot page ----------------
 
 async function selectDepot(id) {
+  pushView({ depot: id });
   state.selected = id;
   state.plan = null;
   for (const n of document.querySelectorAll('.depot')) n.classList.toggle('on', +n.dataset.id === id);
@@ -313,13 +389,16 @@ function renderDepot() {
 
   const head = el('div', 'dhead');
   head.append(el('h2', null, s.name ? s.name : 'Depot ' + s.id));
-  if (s.name) head.append(el('span', 'tag mode', 'depot ' + s.id));
-  if (s.nameSource === 'steam') {
-    head.append(el('span', 'tag steam', 'steam' + (s.steamType ? ' · ' + s.steamType : '')));
-  }
-  if (s.hasReset) head.append(el('span', 'tag reset', 'reset'));
-  if (!s.complete) head.append(el('span', 'tag gap', 'incomplete'));
-  if (s.complete && !s.hasReset) head.append(el('span', 'tag ok', 'clean chain'));
+
+  // SteamDB holds the human-facing record for a depot — which apps own it, its manifests and its
+  // history — so that is where someone reading a bare depot id wants to go next. The id stays on
+  // the link rather than in a badge of its own, which is all the badge ever said.
+  const sdb = el('a', 'sdb', `SteamDB · ${s.id}`);
+  sdb.href = `https://steamdb.info/depot/${s.id}`;
+  sdb.target = '_blank';
+  sdb.rel = 'noreferrer';
+  sdb.title = `Open depot ${s.id} on steamdb.info`;
+  head.append(sdb);
   d.append(head);
 
   const sub = el('div', 'dsub');
@@ -327,8 +406,11 @@ function renderDepot() {
     `${s.versions} version${s.versions === 1 ? '' : 's'} (0–${s.maxVersion})`,
     `${s.dats} dats · ${s.blobs} blobs`,
     s.datBytes ? `~${bytes(s.datBytes + s.blobBytes)}` : 'sizes not loaded',
-    s.first && s.last ? `${s.first} → ${s.last}` : '',
+    s.first && s.last ? `${fmtDate(s.first)} → ${fmtDate(s.last)}` : '',
     s.roots?.length ? `top level: ${s.roots.slice(0, 6).join(', ')}` : '',
+    s.hasReset ? 'has a reset' : '',
+    !s.complete ? 'incomplete chain' : '',
+    s.nameSource === 'steam' ? `named by steam${s.steamType ? ` · ${s.steamType}` : ''}` : '',
     s.nameSource === 'steam' && s.manifestName ? `manifest name: ${s.manifestName}` : '',
   ]) if (t) sub.append(el('span', null, t));
   d.append(sub);
@@ -337,10 +419,6 @@ function renderDepot() {
     d.append(note('bad', 'Encrypted, and no key is known for it',
       'This depot really is AES-encrypted and it is not in the key table, so it cannot be unpacked ' +
       'unless you supply the key yourself. Downloading and browsing still work.'));
-  } else if (s.encrypted === false && !s.hasKey) {
-    d.append(note('info', 'Not encrypted — no key needed',
-      'This depot is absent from the key table, but its files are plain zlib rather than AES, so it ' +
-      'unpacks without one.'));
   }
   if (s.hasReset) {
     d.append(note('warn', 'This depot was reset',
@@ -386,7 +464,7 @@ function planPanel(s) {
     const forked = entry.blobs.length > 1 || entry.dats.length > 1;
 
     let label = `v${entry.version}`;
-    if (date) label += `  ·  ${date.slice(0, 10)}`;
+    if (date) label += `  ·  ${fmtDate(date)}`;
 
     // Numbering starts at v0, so spell out which end is which rather than leaving it to be guessed.
     if (entry.version === newest) label += '  ·  latest';
@@ -411,7 +489,12 @@ function planPanel(s) {
   const dlBtn = el('button', 'primary', 'Download chain');
   const exBtn = el('button', 'ghost', 'Extract');
 
-  row.append(vLabel, vSel, crcLabel, crcSel, sizeInfo, planBtn, dlBtn, exBtn);
+  // Alternative to "Download chain": the browser saves the chain into a folder you pick, laid out
+  // the way the extractor expects, instead of it going into the app's own archive folder.
+  const webBtn = el('button', 'ghost', 'Download chain using browser');
+  webBtn.title = 'Pick a folder; the chain is saved into blobs/ and dats/ inside it';
+
+  row.append(vLabel, vSel, crcLabel, crcSel, sizeInfo, planBtn, dlBtn, exBtn, webBtn);
   body.append(row);
 
   const out = el('div');
@@ -426,7 +509,7 @@ function planPanel(s) {
 
     crcSel.innerHTML = '';
     crcSel.append(new Option('auto', ''));
-    for (const b of choices) crcSel.append(new Option(`${b.crc}  ·  ${b.date ?? ''}`, b.crc));
+    for (const b of choices) crcSel.append(new Option(`${b.crc}  ·  ${b.date ? fmtDate(b.date) : ''}`, b.crc));
 
     // Nothing to pick unless the version forked, so the control stays out of the way entirely.
     const choose = choices.length > 1;
@@ -472,6 +555,7 @@ function planPanel(s) {
   planBtn.onclick = () => doPlan(s.id, +vSel.value, crcSel.value, false);
   dlBtn.onclick = () => doPlan(s.id, +vSel.value, crcSel.value, true);
   exBtn.onclick = () => doExtract(s.id, +vSel.value, crcSel.value);
+  webBtn.onclick = () => doBrowserChain(s.id, +vSel.value, crcSel.value);
 
   return p;
 }
@@ -486,8 +570,7 @@ async function doPlan(depot, version, blobCrc, download) {
     state.plan = plan;
     renderPlan(plan, out);
     if (res.jobId) {
-      showTab('downloads');
-      $('#activity').classList.remove('min');
+      applyActivity(true);
       pollJobs();
     }
   } catch (e) {
@@ -610,50 +693,62 @@ async function pollHistory(depotId, keepPolling) {
     ? `${num(r.fetch.done)} / ${num(r.fetch.total)} blobs…`
     : (r.fetch.message || 'blobs are kilobytes — the whole history costs a few MB');
 
-  renderHistory(depotId, r.versions);
+  renderHistory(depotId, r);
 
   if (r.fetch.running || keepPolling) {
     setTimeout(() => pollHistory(depotId, r.fetch.running), 1000);
   }
 }
 
-function renderHistory(depotId, versions) {
+function renderHistory(depotId, data) {
   const h = state.history;
   const list = h.list;
+  const versions = data.versions;
+  const branches = data.branches || [];
 
   // Rebuild only when the shape changed, so an open section is not collapsed under the user.
-  const sig = versions.map((v) => `${v.version}/${v.crc}/${v.local ? v.changedCount : 'x'}`).join('|');
+  const sig = versions.map((v) => `${v.branch}/${v.version}/${v.crc}/${v.local ? v.changedCount : 'x'}`).join('|');
   if (list.dataset.sig === sig) return;
   list.dataset.sig = sig;
 
   list.innerHTML = '';
 
-  // "First release" means the earliest version and nothing else. It is not the same as a version
-  // whose dat happens to hold every file it has — that is true whenever everything was rewritten,
-  // and it was labelling late versions of small depots as the first one.
-  const earliest = Math.min(...versions.map((v) => v.version));
+  // A reset restarts the numbering, so "first release" is the earliest version of its own branch —
+  // a depot can genuinely have several, one per line of descent.
+  const earliestIn = new Map();
+  for (const v of versions) {
+    const cur = earliestIn.get(v.branch);
+    if (cur === undefined || v.version < cur) earliestIn.set(v.branch, v.version);
+  }
+
+  let lastBranch = null;
 
   for (const v of versions) {
-    const key = `${v.version}/${v.crc}`;
+    if (branches.length > 1 && v.branch !== lastBranch) {
+      lastBranch = v.branch;
+      list.append(branchHeader(branches[v.branch], v.branch, branches.length));
+    }
+
+    const key = `${v.branch}/${v.version}/${v.crc}`;
     const d = el('details', 'vitem');
     if (h.open.has(key)) d.open = true;
 
     const sm = el('summary');
     sm.append(el('b', 'vver', 'v' + v.version));
-    sm.append(el('span', 'vdate', v.date ? v.date.slice(0, 10) : '—'));
+    sm.append(el('span', 'vdate', fmtDate(v.date)));
 
     if (v.error) {
       sm.append(el('span', 'vwhat bad', v.error.slice(0, 60)));
     } else if (!v.local) {
       sm.append(el('span', 'vwhat dim', 'blob not downloaded'));
-    } else if (v.version === earliest) {
+    } else if (v.version === earliestIn.get(v.branch)) {
       sm.append(el('span', 'vwhat', `${num(v.addedCount)} files · first release`));
       sm.append(el('span', 'vdelta up', signed(v.deltaBytes)));
       sm.append(el('span', 'vsize', bytes(v.payloadBytes)));
     } else if (v.unclassified) {
-      // Without the previous version's blob there is no way to tell a new file from a rewritten one.
+      // Without the predecessor's blob there is no telling a new file from a rewritten one.
       sm.append(el('span', 'vwhat dim',
-        `${num(v.changedCount)} in this version · fetch v${v.version - 1} to split new from changed`));
+        `${num(v.changedCount)} in this version · predecessor unknown`));
       sm.append(el('span', 'vsize', bytes(v.payloadBytes)));
     } else {
       const bits = [];
@@ -668,10 +763,22 @@ function renderHistory(depotId, versions) {
     }
 
     sm.append(el('span', 'vcrc', v.crc));
+
+    // Straight-to-browser saves for a single file. Deliberately quiet, and they must not toggle
+    // the section they sit in.
+    for (const [label, url, size] of [['blob', v.blobUrl, v.blobBytes], ['dat', v.datUrl, v.datBytes]]) {
+      if (!url) continue;
+      const a = el('a', 'vget', label);
+      a.href = url;
+      a.setAttribute('download', '');
+      a.title = `save the ${label}${size > 0 ? ' — ' + bytes(size) : ''}`;
+      a.onclick = (e) => e.stopPropagation();
+      sm.append(a);
+    }
+
     d.append(sm);
 
     const inner = el('div', 'vbody');
-    inner.textContent = '';
     d.append(inner);
 
     d.ontoggle = () => {
@@ -685,6 +792,22 @@ function renderHistory(depotId, versions) {
 
     list.append(d);
   }
+}
+
+// Depots that were reset carry several independent chains that all count from v0. Without a header
+// per chain the history interleaves them and every second row claims to be a first release.
+function branchHeader(b, index, total) {
+  const head = el('div', 'vbranch');
+  head.append(el('b', null, `Branch ${index + 1} of ${total}`));
+
+  const span = b ? `v${b.minVersion}–v${b.maxVersion}` : '';
+  const dates = b && b.firstDate ? `${fmtDate(b.firstDate)} → ${fmtDate(b.lastDate ?? b.firstDate)}` : '';
+  const forks = b && b.forksFromVersion != null ? `continues from v${b.forksFromVersion}` : 'own root';
+
+  for (const t of [span, dates, `${b ? b.blobCount : 0} versions`, forks]) {
+    if (t) head.append(el('span', null, t));
+  }
+  return head;
 }
 
 async function loadVersionFiles(depotId, v, host) {
@@ -767,11 +890,158 @@ async function loadVersionFiles(depotId, v, host) {
 
 // ---------------- extract ----------------
 
+// Saves a whole chain into a folder of the user's choosing, using the browser's own file access
+// rather than the app's download queue. The layout matches what the extractor expects — blobs/ and
+// dats/ side by side — so once it finishes, Extract has everything it needs.
+//
+// The bytes are relayed by this app rather than fetched from the mirror by the page: the mirrors
+// send no Access-Control-Allow-Origin and refuse OPTIONS, so a cross-origin read is impossible.
+async function doBrowserChain(depot, version, blobCrc) {
+  const out = $('#planOut');
+
+  if (!window.showDirectoryPicker) {
+    out.innerHTML = '';
+    out.append(note('warn', 'This browser cannot save into a folder',
+      'Choosing a folder needs the File System Access API, which Chrome, Edge and Opera have and ' +
+      'Firefox and Safari do not. Use "Download chain" instead — that one saves into the ' +
+      'download directory the app already uses.'));
+    return;
+  }
+
+  out.innerHTML = '<div class="muted">resolving chain…</div>';
+
+  let plan;
+  try {
+    plan = await api.post('/api/plan', { depot, version, blobCrc: blobCrc || null });
+    plan = plan.plan ?? plan;
+  } catch (e) {
+    out.innerHTML = '';
+    out.append(note('bad', 'Cannot build the chain', e.message || String(e)));
+    return;
+  }
+
+  if (plan.error || plan.needsChoice) { renderPlan(plan, out); return; }
+
+  let root;
+  try {
+    root = await window.showDirectoryPicker({ mode: 'readwrite', id: 'steam2chain' });
+  } catch {
+    out.innerHTML = '';
+    out.append(note('info', 'Cancelled', 'No folder was chosen, so nothing was downloaded.'));
+    return;
+  }
+
+  // Both subfolders are made up front, so the folder is already in the shape the extractor wants
+  // even if the download is interrupted half way.
+  const dirs = {};
+  for (const name of ['blobs', 'dats']) {
+    dirs[name] = await root.getDirectoryHandle(name, { create: true });
+  }
+
+  out.innerHTML = '';
+  const head = el('div', 'dsub');
+  head.textContent = `Saving ${num(plan.files.length)} file(s) into ${root.name}/`;
+  const bar = el('div', 'rangeprog');
+  const track = el('div', 'bar');
+  const fill = el('i');
+  track.append(fill);
+  const line = el('span', 'hint', 'starting…');
+  bar.append(track, line);
+  out.append(head, bar);
+
+  let done = 0, skipped = 0, failed = 0, saved = 0;
+  const total = plan.files.length;
+
+  for (const f of plan.files) {
+    const dir = dirs[f.dir] ?? dirs[f.kind === 'dat' ? 'dats' : 'blobs'];
+
+    try {
+      // A file already the right size is left alone, which makes the whole thing resumable:
+      // point it at the same folder again and it picks up where it stopped.
+      if (f.size > 0) {
+        try {
+          const existing = await (await dir.getFileHandle(f.name)).getFile();
+          if (existing.size === f.size) { skipped++; done++; continue; }
+        } catch { /* not there yet */ }
+      }
+
+      const res = await fetch(`/api/file/${f.kind === 'dat' ? 'dats' : 'blobs'}/${encodeURIComponent(f.name)}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+      const handle = await dir.getFileHandle(f.name, { create: true });
+      const writable = await handle.createWritable();
+      await res.body.pipeTo(writable);
+
+      saved += f.size > 0 ? f.size : 0;
+      done++;
+    } catch (e) {
+      failed++;
+      done++;
+    }
+
+    fill.style.width = `${Math.round((done / total) * 100)}%`;
+    line.textContent = `${num(done)} / ${num(total)}`
+      + (skipped ? `  ·  ${num(skipped)} already there` : '')
+      + (failed ? `  ·  ${num(failed)} failed` : '');
+  }
+
+  fill.style.width = '100%';
+  line.textContent = `${num(done - failed)} of ${num(total)} file(s) in ${root.name}/`
+    + (saved ? `  ·  ${bytes(saved)} written` : '')
+    + (failed ? `  ·  ${num(failed)} failed` : '');
+
+  out.append(extractHint(root.name));
+}
+
+// Extract runs in the app, not in the page, and the page is never told where the folder it just
+// wrote to actually lives — the picker hands out a handle, not a path. So when the chosen folder
+// is not the one the app already reads from, it has to be pointed at it.
+function extractHint(folderName) {
+  const current = state.settings?.dataDir ?? '';
+  const parts = current.replace(/[\\/]+$/, '').split(/[\\/]/);
+
+  if (parts.length && parts[parts.length - 1].toLowerCase() === folderName.toLowerCase()) {
+    return note('info', 'Ready to extract',
+      `This is the folder the app already downloads into (${current}), so Extract will find the chain.`);
+  }
+
+  const box = note('info', 'One step before Extract',
+    'Extract reads whichever download directory the app is set to, and a browser never reveals '
+    + 'the real path of a '
+    + `folder you pick. Give the full path of "${folderName}" to point the app at it.`);
+
+  const row = el('div', 'dlgrow');
+  const input = el('input');
+  input.type = 'text';
+  input.style.flex = '1';
+  // A sibling of the current download directory is the likely spot, so it is worth guessing.
+  input.value = parts.length > 1
+    ? parts.slice(0, -1).concat(folderName).join('\\')
+    : folderName;
+
+  const use = el('button', 'primary', 'Use this folder');
+  use.onclick = async () => {
+    use.disabled = true;
+    try {
+      await api.post('/api/settings', { dataDir: input.value });
+      box.replaceChildren(el('b', null, 'Ready to extract'),
+        document.createTextNode(`The app now reads from ${input.value}. Press Extract.`));
+      refreshState();
+    } catch (e) {
+      use.disabled = false;
+      alert('Could not set the folder: ' + (e.message || e));
+    }
+  };
+
+  row.append(input, use);
+  box.append(row);
+  return box;
+}
+
 async function doExtract(depot, version, blobCrc) {
   try {
     await api.post('/api/extract', { depot, version, blobCrc: blobCrc || null, filter: null });
-    showTab('extract');
-    $('#activity').classList.remove('min');
+    applyActivity(true);
     pollExtract();
   } catch (e) {
     alert('Extract failed to start: ' + (e.message || e));
@@ -785,16 +1055,10 @@ async function pollJobs() {
   try { jobs = await api.get('/api/jobs'); } catch { return; }
 
   const running = jobs.filter((j) => j.status === 'running').length;
-  $('#dlBadge').textContent = running ? running : '';
+  setActivityBusy('jobs', running > 0);
 
-  const pane = $('#tab-downloads');
-  if (!jobs.length) {
-    pane.innerHTML = '<div class="muted">No downloads yet. Pick a depot and press “Download chain”.</div>';
-    return;
-  }
-
-  pane.innerHTML = '';
-  for (const j of jobs) pane.append(jobCard(j));
+  state.act.jobList = jobs;
+  renderActivity();
 }
 
 function jobCard(j) {
@@ -865,16 +1129,14 @@ async function pollExtract() {
   try { runs = await api.get('/api/extract'); } catch { return; }
 
   const running = runs.filter((r) => r.status === 'running').length;
-  $('#exBadge').textContent = running ? running : '';
+  setActivityBusy('extract', running > 0);
 
-  const pane = $('#tab-extract');
-  if (!runs.length) {
-    pane.innerHTML = '<div class="muted">Nothing extracted yet. extract.exe is fetched from the mirror on first use.</div>';
-    return;
-  }
+  state.act.extractList = runs;
+  renderActivity();
+}
 
-  pane.innerHTML = '';
-  for (const r of runs) {
+function extractCard(r) {
+  {
     const card = el('div', 'job');
 
     const head = el('div', 'jobhead');
@@ -912,14 +1174,212 @@ async function pollExtract() {
     card.append(meta);
 
     card.append(el('pre', 'log', (r.log ?? []).slice(-200).join('\n')));
-    pane.append(card);
+    return card;
   }
 }
 
-function showTab(name) {
-  for (const b of document.querySelectorAll('.acttabs button[data-tab]')) b.classList.toggle('on', b.dataset.tab === name);
-  for (const p of document.querySelectorAll('.tabpane')) p.classList.toggle('on', p.id === 'tab-' + name);
+// Downloads and extractions share one list, newest first: they are two halves of the same job,
+// and splitting them across tabs only hid whichever one you were not looking at.
+function renderActivity() {
+  const host = $('#actList');
+  if (!host) return;
+
+  const jobs = state.act.jobList ?? [];
+  const runs = state.act.extractList ?? [];
+
+  const running = jobs.filter((j) => j.status === 'running').length
+                + runs.filter((r) => r.status === 'running').length;
+  const badge = $('#actBadge');
+  if (badge) badge.textContent = running ? String(running) : '';
+
+  if (!jobs.length && !runs.length) {
+    host.innerHTML = '<div class="muted">Nothing yet. Pick a depot and start a download.</div>';
+    return;
+  }
+
+  const entries = [
+    ...jobs.map((j) => ({ at: j.started, node: () => jobCard(j) })),
+    ...runs.map((r) => ({ at: r.started, node: () => extractCard(r) })),
+  ].sort((a, b) => String(b.at).localeCompare(String(a.at)));
+
+  host.innerHTML = '';
+  for (const e of entries) host.append(e.node());
 }
+
+
+// ---------------- activity panel ----------------
+
+// Collapsed while nothing is running, so the depot page gets the screen. It opens on its own when
+// a download or an extraction starts, and the arrow overrides that until the work state changes.
+function applyActivity(open) {
+  const a = $('#activity');
+  a.classList.toggle('min', !open);
+
+  const btn = $('#actToggle');
+  btn.textContent = open ? '▾' : '▴';
+  btn.title = open ? 'Collapse' : 'Expand';
+}
+
+function setActivityBusy(kind, value) {
+  const a = state.act;
+  a[kind] = value;
+
+  const busy = !!(a.jobs || a.extract);
+  if (busy !== a.busy) {
+    a.busy = busy;
+    a.manualOpen = null;   // the work changed state, so it gets the panel back
+  }
+
+  applyActivity(a.manualOpen ?? busy);
+}
+
+// ---------------- global file search ----------------
+
+// Searches paths inside blobs already on disk. Nothing is fetched to answer a query: a depot whose
+// blobs have not been downloaded simply is not in the index, and the note under the box says so.
+async function runFileSearch(q) {
+  const note = $('#fileSearchNote');
+  const detail = $('#detail');
+
+  if (q.trim().length < 2) {
+    note.textContent = state.fileIndex || '';
+    if (state.searching) { state.searching = false; renderDepotOrEmpty(); }
+    return;
+  }
+
+  state.searching = true;
+
+  let r;
+  try { r = await api.get('/api/files/search?' + new URLSearchParams({ q, limit: 300 })); }
+  catch { return; }
+
+  if (!state.searching) return;
+
+  // Nothing indexed yet: offer to build it rather than pretending the file does not exist.
+  if (!r.indexed && !r.running) {
+    detail.innerHTML = '';
+    const box = el('div', 'empty');
+    box.append(el('h2', null, 'Nothing indexed yet'));
+    box.append(el('p', null,
+      'File search reads the blobs already on disk. Download some blobs for a depot, then build '
+      + 'the index — it costs no network at all.'));
+    const btn = el('button', 'primary', 'Index downloaded blobs');
+    btn.onclick = async () => {
+      btn.disabled = true;
+      btn.textContent = 'Indexing…';
+      try { await api.post('/api/files/index'); } catch { }
+      setTimeout(() => runFileSearch($('#fileSearch').value), 1200);
+    };
+    box.append(btn);
+    detail.append(box);
+    return;
+  }
+
+  note.textContent = r.running
+    ? 'indexing…'
+    : `${num(r.hits.length)}${r.truncated ? '+' : ''} of ${num(r.indexed)} paths · ${num(r.depots)} depots`;
+
+  detail.innerHTML = '';
+
+  const head = el('div', 'dhead');
+  head.append(el('h2', null, `Files matching “${q.trim()}”`));
+  detail.append(head);
+
+  const sub = el('div', 'dsub');
+  sub.append(el('span', null,
+    `${num(r.hits.length)}${r.truncated ? '+ (capped)' : ''} hit(s) across ${num(r.depots)} indexed depot(s)`));
+  sub.append(el('span', null, 'only depots whose blobs are downloaded are searched'));
+  detail.append(sub);
+
+  if (!r.hits.length) {
+    detail.append(note2('info', 'No match here',
+      'The file may live in a depot whose blobs are not downloaded yet — those cannot be searched.'));
+    return;
+  }
+
+  const open = (depot) => {
+    $('#fileSearch').value = '';
+    state.searching = false;
+    $('#fileSearchNote').textContent = state.fileIndex || '';
+    selectDepot(depot);
+  };
+
+  // Blobs downloaded after the index was built are simply not in it, so a search can look complete
+  // while missing them. Say so where the results are, with the fix one click away.
+  const behind = (r.blobsOnDisk ?? 0) - (r.blobsIndexed ?? 0);
+  if (behind > 0 && !r.running) {
+    const box = note2('warn', 'Index is behind',
+      `${num(behind)} blob(s) have been downloaded since this index was built and are not searched yet.`);
+    const btn = el('button', 'primary', 'Reindex');
+    btn.onclick = async () => {
+      btn.disabled = true;
+      btn.textContent = 'Indexing…';
+      try { await api.post('/api/files/index'); } catch { /* the note below reports the state */ }
+      setTimeout(() => runFileSearch($('#fileSearch').value), 1200);
+    };
+    box.append(btn);
+    detail.append(box);
+  }
+
+  // One depot, one entry. Hits come back depot by depot, but without grouping a depot with twenty
+  // matches printed its id and name twenty times over and buried the paths that actually differ.
+  const groups = new Map();
+  for (const h of r.hits) {
+    let g = groups.get(h.depot);
+    if (!g) groups.set(h.depot, g = { name: h.name || '', paths: [] });
+    g.paths.push(h.path);
+  }
+
+  const list = el('div', 'fhits');
+  for (const [depot, g] of groups) {
+    const group = el('div', 'fgroup');
+
+    const gh = el('div', 'fghead');
+    gh.append(el('b', 'fdepot', 'depot ' + depot));
+    if (g.name) gh.append(el('span', 'fname', g.name));
+    gh.append(el('span', 'fcount', `${num(g.paths.length)} file${g.paths.length === 1 ? '' : 's'}`));
+    gh.onclick = () => open(depot);
+    group.append(gh);
+
+    for (const path of g.paths) {
+      const row = el('div', 'fhit');
+      row.append(el('span', 'fpath', path));
+      row.onclick = () => open(depot);
+      group.append(row);
+    }
+
+    list.append(group);
+  }
+  detail.append(list);
+}
+
+// note() builds a styled callout; aliased so the search code reads clearly next to its own note field.
+const note2 = (kind, title, body) => note(kind, title, body);
+
+function renderDepotOrEmpty() {
+  if (state.detail) renderDepot();
+  else {
+    $('#detail').innerHTML =
+      '<div class="empty"><h2>Pick a depot</h2><p>Files are stored as deltas: extracting version '
+      + '<em>N</em> needs every version below it too.</p></div>';
+  }
+}
+
+let fileSearchTimer;
+$('#fileSearch').oninput = (e) => {
+  clearTimeout(fileSearchTimer);
+  const q = e.target.value;
+  fileSearchTimer = setTimeout(() => {
+    // Refining a query replaces its entry: going back should leave the search, not retrace every
+    // letter that was typed to build it. Clearing the box likewise rewrites the entry rather than
+    // adding one, so back still lands on whatever was open before the search started.
+    const refining = !!history.state?.q;
+    runFileSearch(q);
+
+    if (q.trim().length >= 2) pushView({ q }, refining);
+    else if (refining) pushView(state.selected != null ? { depot: state.selected } : {}, true);
+  }, 220);
+};
 
 // ---------------- wiring ----------------
 
@@ -960,11 +1420,10 @@ $('#testMirrors').onclick = async (e) => {
   refreshState();
 };
 
-for (const b of document.querySelectorAll('.acttabs button[data-tab]')) b.onclick = () => showTab(b.dataset.tab);
 $('#actToggle').onclick = () => {
-  const a = $('#activity');
-  a.classList.toggle('min');
-  $('#actToggle').textContent = a.classList.contains('min') ? '▴' : '▾';
+  const open = $('#activity').classList.contains('min');
+  state.act.manualOpen = open;
+  applyActivity(open);
 };
 
 $('#openSettings').onclick = () => {
@@ -977,7 +1436,7 @@ $('#openSettings').onclick = () => {
   $('#setBlobStreams').value = s.blobConcurrency ?? 32;
   $('#setDatStreams').value = s.datConcurrency ?? 2;
   $('#setWarmAhead').value = s.warmupLookahead ?? 2;
-  $('#setBigFileMb').value = Math.round((s.bigFileBytes ?? 31457280) / 1048576);
+  $('#setBigFileMb').value = Math.round((s.bigFileBytes ?? 30000000) / 1_000_000);
   $('#setVerify').checked = !!s.verifyHashes;
   $('#setFailover').checked = !!s.failover;
   $('#settingsDlg').showModal();
@@ -1008,6 +1467,149 @@ $('#checkUpdate').onclick = async (e) => {
 };
 $('#reloadIndex').onclick = () => api.post('/api/index/reload', { refresh: true, sizes: true });
 $('#reloadSizes').onclick = () => api.post('/api/index/sizes');
+
+// ---------------- blobs by depot range ----------------
+
+// Blobs are the cheap half of the archive — tens to a few hundred KB each against dats measured in
+// gigabytes — and they carry the file lists that the version diffs and the global file search read.
+// Pulling a span of depot ids at once is how you make either of those useful without committing to
+// the dats. The dialog shows the real byte estimate for the range before anything starts.
+
+let rangePoll = null;
+
+function rangeBounds() {
+  const from = parseInt($('#rangeFrom').value, 10);
+  const to = parseInt($('#rangeTo').value, 10);
+  return Number.isFinite(from) && Number.isFinite(to) ? { from, to } : null;
+}
+
+async function refreshRangeInfo() {
+  const info = $('#rangeInfo');
+  const b = rangeBounds();
+
+  if (!b) { info.textContent = 'Enter a first and last depot id.'; return; }
+
+  try {
+    const r = await api.get(`/api/blobs/range?from=${b.from}&to=${b.to}`);
+    const p = r.preview;
+
+    if (!p || !p.depots) { info.textContent = 'No depots in that range.'; return; }
+
+    const parts = [`${num(p.depots)} depot(s)`, `${num(p.blobs)} blob(s)`];
+    parts.push(p.missing ? `${num(p.missing)} still to fetch` : 'all already on disk');
+    if (p.bytes > 0) parts.push(`~${bytes(p.bytes)}`);
+    info.textContent = parts.join('  ·  ');
+  } catch {
+    info.textContent = '';
+  }
+}
+
+async function pollRange() {
+  const r = await api.get('/api/blobs/range');
+  const box = $('#rangeProg');
+  const btn = $('#rangeStart');
+
+  box.hidden = !(r.running || r.done || r.failed);
+  $('#rangeBar').style.width = r.total ? `${Math.round((r.done / r.total) * 100)}%` : '0';
+  $('#rangeProgText').textContent = r.running
+    ? `${num(r.done)} / ${num(r.total)}${r.failed ? `  ·  ${num(r.failed)} failed` : ''}`
+    : (r.message ?? '');
+
+  btn.disabled = r.running;
+  btn.textContent = r.running ? 'Downloading…' : 'Download blobs';
+
+  // The search index only sees blobs that were on disk when it was built.
+  if (!r.running && rangePoll) {
+    clearInterval(rangePoll);
+    rangePoll = null;
+    refreshRangeInfo();
+  }
+}
+
+$('#blobRange').onclick = () => {
+  const list = state.depots.items ?? [];
+  if (!$('#rangeFrom').value && list.length) {
+    $('#rangeFrom').value = list[0].id;
+    $('#rangeTo').value = list[Math.min(list.length - 1, 99)].id;
+  }
+  refreshRangeInfo();
+  pollRange();
+  $('#rangeDlg').showModal();
+};
+
+$('#rangeFrom').oninput = refreshRangeInfo;
+$('#rangeTo').oninput = refreshRangeInfo;
+
+$('#rangeStart').onclick = async () => {
+  const b = rangeBounds();
+  if (!b) return;
+
+  await api.post('/api/blobs/range', b);
+  if (!rangePoll) rangePoll = setInterval(pollRange, 700);
+  pollRange();
+};
+
+// ---------------- navigation history ----------------
+//
+// Mouse buttons 4 and 5 are the browser's own back and forward. A page cannot rely on receiving
+// them as events — browsers act on them in the chrome, and whether anything reaches JavaScript
+// varies by browser and by driver. Intercepting them is also the wrong shape: preventing the
+// default and calling history.back() ourselves navigates twice wherever the event *is* delivered.
+//
+// So instead of catching the buttons, the app gives the browser real history entries to move
+// through. Then the side buttons work by doing exactly what they already do, and Alt+Arrow, the
+// toolbar buttons and swipe gestures come along for free.
+
+// Set while a view is being restored, so replaying history does not record itself as new history.
+let applyingHistory = false;
+
+function viewUrl(view) {
+  if (view.depot != null) return '#depot=' + view.depot;
+  if (view.q) return '#q=' + encodeURIComponent(view.q);
+  return '#';
+}
+
+function viewFromHash() {
+  const h = decodeURIComponent(location.hash.slice(1));
+  const depot = /^depot=(\d+)$/.exec(h);
+  if (depot) return { depot: +depot[1] };
+  if (h.startsWith('q=')) return { q: h.slice(2) };
+  return {};
+}
+
+function pushView(view, replace = false) {
+  if (applyingHistory) return;
+  history[replace ? 'replaceState' : 'pushState'](view, '', viewUrl(view));
+}
+
+// Renders a view without recording it — this is what going back and forward runs.
+async function applyView(view) {
+  applyingHistory = true;
+  try {
+    if (view.q) {
+      $('#fileSearch').value = view.q;
+      await runFileSearch(view.q);
+      return;
+    }
+
+    $('#fileSearch').value = '';
+    state.searching = false;
+    $('#fileSearchNote').textContent = state.fileIndex || '';
+
+    if (view.depot != null) {
+      await selectDepot(view.depot);
+    } else {
+      state.selected = null;
+      state.detail = null;
+      for (const n of document.querySelectorAll('.depot.on')) n.classList.remove('on');
+      renderDepotOrEmpty();
+    }
+  } finally {
+    applyingHistory = false;
+  }
+}
+
+window.addEventListener('popstate', (e) => applyView(e.state ?? viewFromHash()));
 
 // ---------------- loop ----------------
 

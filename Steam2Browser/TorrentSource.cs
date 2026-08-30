@@ -29,7 +29,7 @@ public sealed class TorrentStatus
 /// <summary>
 /// The archive as a BitTorrent swarm, used as a fourth source alongside the three HTTP mirrors.
 ///
-/// The torrent holds all 116 339 files — 12.11 TiB, matching the archive exactly — so it is only
+/// The torrent holds all 116 339 files — 13.32 TB, matching the archive exactly — so it is only
 /// usable because BitTorrent can fetch selected files: everything is set to DoNotDownload and only
 /// the files a chain actually needs are raised in priority.
 ///
@@ -171,7 +171,7 @@ public sealed class TorrentSource(Settings settings)
             }
 
             // Stop before doing anything else. A running manager with everything at default
-            // priority downloads the entire 12.11 TiB — it had already pulled 38 GB before this
+            // priority downloads the entire 13.32 TB — it had already pulled 38 GB before this
             // was caught. Nothing may transfer until a chain explicitly selects files.
             await _manager.StopAsync(TimeSpan.FromSeconds(10));
 

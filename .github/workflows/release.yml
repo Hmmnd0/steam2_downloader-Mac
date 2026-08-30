@@ -133,12 +133,15 @@ jobs:
         continue-on-error: true
 
       - name: Publish
+        # EnableCompressionInSingleFile is deliberately left off here: with it on, the published
+        # binary hit an intermittent System.IO.IOException / AccessViolationException under
+        # concurrent requests on .NET 10.0.400 osx-arm64 (crashed 2/2 fresh-process burst tests
+        # with compression on, survived 6+ with it off). Revisit once a newer .NET 10 patch ships.
         run: |
           dotnet publish Steam2Browser/Steam2Browser.csproj \
             -c Release -r osx-arm64 --self-contained true \
             -p:PublishSingleFile=true \
             -p:IncludeNativeLibrariesForSelfExtract=true \
-            -p:EnableCompressionInSingleFile=true \
             -p:PublishTrimmed=false \
             -p:DebugType=none \
             -o publish
@@ -153,7 +156,10 @@ jobs:
 
       - name: Smoke test
         # Catches a build that publishes but cannot start — the embedded UI failing to
-        # resolve would otherwise only show up on a user's machine.
+        # resolve would otherwise only show up on a user's machine. Also fires a burst of
+        # concurrent requests: an intermittent AccessViolationException under concurrent
+        # connections (single-file bundle related, see the Publish step) only ever showed up
+        # under load, never on a single sequential request.
         run: |
           chmod +x publish/steam2browser
           ./publish/steam2browser --no-browser --port=5099 &
@@ -166,6 +172,21 @@ jobs:
               break
             fi
           done
+          if [ "$ok" = true ]; then
+            for round in 1 2 3; do
+              for i in $(seq 1 30); do
+                curl -s http://127.0.0.1:5099/ -o /dev/null &
+                curl -s http://127.0.0.1:5099/api/state -o /dev/null &
+                curl -s "http://127.0.0.1:5099/api/depots?take=20" -o /dev/null &
+              done
+              wait
+              if ! kill -0 $pid 2>/dev/null; then
+                ok=false
+                echo "binary crashed under concurrent load (round $round)" >&2
+                break
+              fi
+            done
+          fi
           kill $pid 2>/dev/null || true
           if [ "$ok" != true ]; then
             echo 'the published binary did not serve its UI' >&2

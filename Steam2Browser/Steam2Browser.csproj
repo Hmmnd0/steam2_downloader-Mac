@@ -34,9 +34,18 @@
   <!--
     Points the in-app update checker at this fork's own releases, not upstream's — upstream ships
     Windows only, and this fork exists specifically for macOS.
+
+    BuildCommitSha is the source of truth for "is this build current": CI passes it via
+    -p:BuildCommitSha=$(git sha) at publish time, matching the exact commit its own release gets
+    tagged from. A publish-time comparison can't use BuildTimeUtc for this — the release is
+    published by a later step in the same CI run than the one that builds this binary, so every
+    fresh build's own release always has a publish timestamp after the build's, making a
+    time-based check say "update available" about itself. Left blank for local/dev builds, which
+    fall back to a best-effort time comparison instead.
   -->
   <ItemGroup>
     <AssemblyMetadata Include="BuildTimeUtc" Value="$([System.DateTime]::UtcNow.ToString('O'))" />
+    <AssemblyMetadata Include="BuildCommitSha" Value="$(BuildCommitSha)" Condition="'$(BuildCommitSha)' != ''" />
     <AssemblyMetadata Include="UpdateRepo" Value="Hmmnd0/steam2_downloader-Mac" />
   </ItemGroup>
 

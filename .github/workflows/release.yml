@@ -74,6 +74,7 @@ jobs:
             -p:IncludeNativeLibrariesForSelfExtract=true \
             -p:PublishTrimmed=false \
             -p:DebugType=none \
+            -p:BuildCommitSha=${{ github.sha }} \
             -o publish
 
       - name: Trim publish leftovers

@@ -15,6 +15,7 @@ public sealed class UpdateStatus
     public string RepoUrl = "";
 
     public DateTime? BuiltUtc;
+    public string? BuiltCommitSha;
     public string? ReleaseTag;
     public DateTime? ReleasePublishedUtc;
     public string? ReleaseUrl;
@@ -25,10 +26,12 @@ public sealed class UpdateStatus
 /// <summary>
 /// Answers "is there a newer build than mine" against this fork's own GitHub releases.
 ///
-/// Unlike upstream (no tags, no releases — compared by commit time instead), this fork publishes
-/// a tagged release on every push to main, so the releases endpoint is the right thing to compare
-/// against: the release's publish time versus the moment this binary was built, which the build
-/// stamps into assembly metadata.
+/// Compared by commit sha, not time: this fork's CI publishes a release from the exact commit it
+/// built, but the release job runs after the build job in the same run, so the release's publish
+/// timestamp is always later than this binary's own build time — a time-based check would call
+/// every fresh build "outdated" relative to its own release. The sha this binary was built from is
+/// stamped into assembly metadata at publish time; the release's target_commitish is the commit
+/// its tag points to. Equal shas mean this binary already is the latest release.
 /// </summary>
 public sealed class UpdateChecker(HttpClient http)
 {
@@ -41,6 +44,7 @@ public sealed class UpdateChecker(HttpClient http)
         Status.Repo = Meta("UpdateRepo") ?? "Hmmnd0/steam2_downloader-Mac";
         Status.RepoUrl = $"https://github.com/{Status.Repo}";
         Status.BuiltUtc = BuildTime();
+        Status.BuiltCommitSha = Meta("BuildCommitSha");
         Status.Message = "not checked yet";
     }
 
@@ -130,6 +134,27 @@ public sealed class UpdateChecker(HttpClient http)
                 : null;
 
             Status.ReleasePublishedUtc = when;
+
+            string? releaseSha = release.TryGetProperty("target_commitish", out var tc) ? tc.GetString() : null;
+
+            // The commit sha is the reliable signal (see class remarks); only fall back to the
+            // build-time heuristic when this binary has none, i.e. a local/dev build.
+            if (!string.IsNullOrEmpty(Status.BuiltCommitSha) && !string.IsNullOrEmpty(releaseSha))
+            {
+                if (string.Equals(Status.BuiltCommitSha, releaseSha, StringComparison.OrdinalIgnoreCase))
+                {
+                    Status.State = "current";
+                    Status.Message = $"up to date — this build is release {Status.ReleaseTag}";
+                }
+                else
+                {
+                    Status.State = "available";
+                    Status.Message = $"update available — release {Status.ReleaseTag} " +
+                                     (when is DateTime w ? $"({Ago(w)}) " : "") +
+                                     "was built from a different commit than this binary";
+                }
+                return;
+            }
 
             if (when is null)
             {

@@ -19,6 +19,24 @@ public sealed class Settings
 
     public string ExtractOutDir { get; set; } = "";
 
+    /// <summary>
+    /// Trackers to announce to on top of the ones inside the magnet. Useful when those are
+    /// unreachable — the magnet's three all resolve to one address that some networks block
+    /// outright. Null means "use the defaults"; an empty array means "none, rely on DHT".
+    /// </summary>
+    public string[]? ExtraTrackers { get; set; }
+
+    public static readonly string[] DefaultExtraTrackers =
+    [
+        "udp://tracker.torrent.eu.org:451/announce",
+        "udp://open.demonii.com:1337/announce",
+        "udp://exodus.desync.com:6969/announce",
+        "udp://tracker.dler.org:6969/announce",
+        "http://tracker.openbittorrent.com:80/announce",
+    ];
+
+    public string[] TrackersToUse => ExtraTrackers ?? DefaultExtraTrackers;
+
     [JsonIgnore] public string ConfigPath { get; set; } = "";
 
     /// <summary>Everything the app writes lives here, in one folder beside the executable.</summary>

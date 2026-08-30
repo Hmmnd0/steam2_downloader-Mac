@@ -3,26 +3,35 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Steam2 Archive Browser</title>
+<title>Steam2 Downloader</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 
 <header class="topbar">
-  <div class="brand">
-    <span class="mark"></span>
+  <div class="brand" id="brand">
     <div>
-      <h1>Steam2 Archive</h1>
-      <p id="loadStatus">starting…</p>
+      <h1>Steam2 Downloader</h1>
+      <p id="loadStatus"></p>
     </div>
   </div>
 
   <div class="stats" id="stats"></div>
 
+  <button id="blobRange" class="ghost statbtn"
+          title="Fetch the blobs of a whole span of depot ids. Blobs hold the version history and file lists, and are a small fraction of the size of the dats.">Download blobs from…</button>
+
+  <div class="filesearch">
+    <input id="fileSearch" type="search" autocomplete="off"
+           placeholder="Find a file in downloaded blobs — &quot;config.ini&quot; for exact name"
+           title="Searches paths inside every blob already on disk. Quote the term to match the file name exactly.">
+    <span class="hint" id="fileSearchNote"></span>
+  </div>
+
   <div class="mirror">
     <label>Mirror</label>
     <select id="mirrorSelect"></select>
-    <button id="testMirrors" class="ghost" title="Download 4 MiB from each mirror and compare">Test speed</button>
+    <button id="testMirrors" class="ghost" title="Download 4 MB from each mirror and compare">Test speed</button>
   </div>
 
   <a id="updateChip" class="chip" href="#" target="_blank" rel="noreferrer" hidden></a>
@@ -39,6 +48,19 @@
       <input id="depotSearch" type="search" placeholder="Depot id or name — &quot;440&quot; for exact"
              title="440 matches 440, 4400, 14400 … Put it in quotes — &quot;440&quot; — to match that id alone."
              autocomplete="off">
+    </div>
+
+    <div class="chips" id="depotFilters">
+      <button data-filter="" class="on">All</button>
+      <button data-filter="reset">Resets</button>
+      <button data-filter="incomplete">Incomplete</button>
+      <button data-filter="big">≥1 GB</button>
+      <button data-filter="single">Single version</button>
+    </div>
+
+    <!-- Sort belongs with the list. Sitting next to the search box it read as a search mode. -->
+    <div class="sortrow">
+      <label for="depotSort">Sort</label>
       <select id="depotSort">
         <option value="id">Depot id</option>
         <option value="size">Total size</option>
@@ -47,14 +69,6 @@
         <option value="files">File count</option>
       </select>
       <button id="depotDir" class="ghost icon" title="Reverse order">↑</button>
-    </div>
-
-    <div class="chips" id="depotFilters">
-      <button data-filter="" class="on">All</button>
-      <button data-filter="reset">Resets</button>
-      <button data-filter="incomplete">Incomplete</button>
-      <button data-filter="big">≥1 GiB</button>
-      <button data-filter="single">Single version</button>
     </div>
 
     <div class="listhead"><span id="depotCount"></span></div>
@@ -73,17 +87,47 @@
 
 </main>
 
-<footer class="activity" id="activity">
+<footer class="activity min" id="activity">
   <div class="acttabs">
-    <button data-tab="downloads" class="on">Downloads <b id="dlBadge"></b></button>
-    <button data-tab="extract">Extract <b id="exBadge"></b></button>
-    <button id="actToggle" class="ghost icon right" title="Collapse">▾</button>
+    <span class="acttitle">Activity <b id="actBadge"></b></span>
+    <button id="actToggle" class="ghost icon right" title="Expand">▴</button>
   </div>
   <div class="actbody">
-    <div id="tab-downloads" class="tabpane on"></div>
-    <div id="tab-extract" class="tabpane"></div>
+    <div id="actList"></div>
   </div>
 </footer>
+
+<dialog id="rangeDlg">
+  <form method="dialog">
+    <h2>Download blobs by depot range</h2>
+
+    <p class="hint">A blob is a depot's metadata: the file list of one version, tens to a few
+       hundred kilobytes depending on how many files that version had. Pulling a span of them fills
+       in version history, per-version diffs and the global file search for every depot in the
+       range, for a small fraction of what the dats would cost. No dat is downloaded — the estimate
+       below is the real figure for the range you picked.</p>
+
+    <div class="dlgrow">
+      <label style="flex:1">From depot
+        <input id="rangeFrom" type="number" min="0" step="1">
+      </label>
+      <label style="flex:1">To depot
+        <input id="rangeTo" type="number" min="0" step="1">
+      </label>
+    </div>
+
+    <div class="hint" id="rangeInfo">—</div>
+    <div class="rangeprog" id="rangeProg" hidden>
+      <div class="bar"><i id="rangeBar"></i></div>
+      <span class="hint" id="rangeProgText"></span>
+    </div>
+
+    <menu>
+      <button value="cancel" class="ghost">Close</button>
+      <button id="rangeStart" type="button" class="primary">Download blobs</button>
+    </menu>
+  </form>
+</dialog>
 
 <dialog id="settingsDlg">
   <form method="dialog">
@@ -99,6 +143,7 @@
     </label>
 
     <label>Parallel downloads
+      <span class="hint">only used when the single-connection option below is off</span>
       <input id="setConcurrency" type="number" min="1" max="64">
     </label>
 
@@ -106,6 +151,28 @@
       <span class="hint">0 chooses a random port; set your VPN forwarded port here</span>
       <input id="setTorrentPort" type="number" min="0" max="65535">
     </label>
+
+    <label class="row">
+      <input id="setPhased" type="checkbox">
+      <span>Phased download: all blobs, then all dats
+        <span class="hint">the mirrors speed a connection up the longer it keeps asking, so dats use
+        only a couple of sustained streams and are never split into ranges</span></span>
+    </label>
+
+    <div class="dlgrow">
+      <label style="flex:1">Blob streams
+        <input id="setBlobStreams" type="number" min="1" max="128">
+      </label>
+      <label style="flex:1">Dat streams
+        <input id="setDatStreams" type="number" min="1" max="64">
+      </label>
+      <label style="flex:1">Warm ahead
+        <input id="setWarmAhead" type="number" min="0" max="16">
+      </label>
+      <label style="flex:1">Solo above, MB
+        <input id="setBigFileMb" type="number" min="0" max="100000">
+      </label>
+    </div>
 
     <label class="row">
       <input id="setVerify" type="checkbox">

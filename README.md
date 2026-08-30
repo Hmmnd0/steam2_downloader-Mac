@@ -1,10 +1,17 @@
 # Steam2 Archive Browser
 
 A browser for the [terarelease](https://de.steam2.download/) Steam2 content dump — 10 876 depots,
-116 339 files, about 12.1 TiB. It shows what the archive holds, works out exactly which files a
-given depot version needs, downloads them, and unpacks them.
+116 339 files, 13.3 TB (12.1 TiB). It shows what the archive holds, works out exactly which files a
+given depot version needs, downloads them, verifies them and unpacks them.
+
+Steam2 was Valve's content system before Steam3 and CDN manifests. Its depots are stored as delta
+chains of `.dat` payloads with `.blob` metadata beside them, so no single file is a complete
+version — extracting version *N* needs every version below it. This tool exists because working
+that out by hand across 58 441 blobs is not practical.
 
 Single executable. It starts a local server and opens your browser.
+
+![Steam2 Archive Browser browsing depot 841 (Portal 2): the depot list, the delta chain planner with its download size estimate, and the version history expanded on v37 to show the four changed files.](assets/img1.png)
 
 ## Run
 
@@ -37,56 +44,86 @@ executable: a freshly downloaded `.app` runs from a randomized read-only locatio
 (macOS App Translocation) unless it's already been moved out of Downloads, so writing there would
 crash on first launch.
 
-The release carries a snapshot of the whole catalog inside the executable, so the first run needs
-no network at all. Fetching that index instead would mean 13 MB of `*_dates.txt` plus two ~20 MB
-directory listings for the sizes — about 54 MB before anything appears. Compacted and gzipped the
-same data is roughly 5 MB, most of it the 116 339 sha256 hashes, which cannot compress. Settings
-has **Re-download index** when you want a fresher one.
+The release embeds a snapshot of the whole catalog, so the first run needs no network and is ready
+in well under a second. Fetching that index instead means 13 MB of `*_dates.txt` plus two ~20 MB
+directory listings for the sizes — about 54 MB before anything appears. **Re-download index** in
+Settings pulls a fresher one when you want it.
 
-## What it does
+## Features
 
-**Browse.** Every depot with its versions, dates, sizes and sha256. Search by depot id or by name;
-quote the term for an exact match — `440` finds 4400 and 14400 too, `"440"` finds only 440.
+### Browse depots
 
-**Plan a chain.** Depot data is stored as deltas, so extracting version *N* needs every version
-below it. Where Valve reset a depot the same version number exists twice and the chain forks; the
-planner follows the parent links recorded inside each blob and picks the right `.dat` by the exact
-size the blob records, instead of downloading both branches.
+Every depot with its versions, dates, sizes and sha256 hashes. Search by depot id or product name;
+quote the term for an exact match — `440` also finds 4400 and 14400, `"440"` finds only 440. Each
+depot links to its [SteamDB](https://steamdb.info/) page. Dates render in your own locale.
 
-**Download.** Parallel, resumable via HTTP range, verified against the sha256 that forms the fourth
-part of every file name. Three mirrors (`de`, `ro`, `us`) serve byte-identical files; the app races
-them on startup, picks the fastest and falls back to the others when one fails.
+### Resolve a delta chain
 
-**Extract.** Built in — the blob container, manifest, file id tables, AES-128-CFB and zlib chunk
-handling are all implemented in process. Output was verified byte-for-byte against the original
-`extract.exe` on two depots, including one whose chain spans 146 versions.
+Where Valve reset a depot, the same version number exists twice and the chain forks. The planner
+follows the parent CRC links recorded inside each blob and picks the right `.dat` by the exact size
+the blob records, instead of downloading both branches. Reset depots are split into branches so a
+fork does not read as one jumbled history.
 
-**Name depots.** Two passes run together. One reads the manifest embedded in each depot's blob,
-which needs no key and gives the real top-level directory names. The other asks the Steam store
-about each depot id and overrides the name when it answers — expect few hits, because Steam2 depot
-ids are not Steam3 app ids. Progress is appended to `steam2info/names.jsonl` after every record, so
-it resumes where it stopped.
+### Version history and diffs
 
-## Two things worth knowing
+Per version: which files were added, changed and removed, with the size delta for each, expandable
+like a diff view. Comparison is by path, not by file id — Steam2 assigns a new file id when a file
+is rewritten, so matching on ids reports every changed file as both new and removed.
 
-**A missing decryption key usually does not matter.** Only 4 629 depots appear in the key table, but
-that table only covers the depots that are actually encrypted. Every file records a filemode: `1` is
-plain zlib and needs no key, only `2` and `3` involve AES. In a sample of 40 depots absent from the
-key table, 38 were checkable and every one of them was unencrypted. So the app asks for a key only
-when a file being extracted really needs one, and marks a depot `no key` only when it is both
-encrypted and unknown to the table. The original `extract.exe` refuses these depots outright,
-before it ever looks at the filemodes.
+### Search inside depots
+
+A global file search over the manifests of every blob already on disk, grouped by depot. It answers
+"which depot ships `client.dll`" without downloading a single `.dat`. Results say when the index is
+behind the blobs on disk and offer to rebuild it.
+
+### Download
+
+Parallel, resumable, verified against the sha256 that forms the fourth part of every file name.
+Three HTTP mirrors (`de`, `ro`, `us`) serve byte-identical files; the app races them on startup and
+picks the fastest, with a BitTorrent swarm as a fourth source.
+
+Blobs are fetched first and dats second, on a couple of sustained connections rather than many
+short ones, because the storage speeds a connection up the longer it keeps asking. Blobs for a whole
+span of depot ids can be pulled at once — enough to browse history and search files across a chunk
+of the archive without paying for any dat.
+
+A browser-side mode saves a chain into a folder you pick, laid out as `blobs/` and `dats/` so the
+extractor finds it, skipping files already the right size.
+
+### Extract
+
+Built in. The blob container, manifest, file id tables, AES-128-CFB and zlib chunk handling are all
+implemented in process. Output was verified byte-for-byte against the original `extract.exe` on two
+depots, one of them with a chain spanning 146 versions.
+
+## Things worth knowing about the archive
+
+**A missing decryption key usually does not matter.** 4 758 depots appear in the key table, but that
+table only covers depots that are actually encrypted. Every file records a filemode: `1` is plain
+zlib and needs no key, only `2` and `3` involve AES. In a sample of 40 depots absent from the key
+table, 38 were checkable and every one was unencrypted. So a key is requested only when a file being
+extracted really needs one. The original `extract.exe` refuses these depots outright, before it ever
+looks at the filemodes.
 
 **223 `(depot, version)` pairs have a blob but no dat**, and 62 depots have gaps in their chain.
-Those are flagged as `incomplete`, because extraction will fail partway through.
+Those are flagged `incomplete`, because extraction fails partway through. 303 depots were reset at
+some point.
+
+**The mirrors are not interchangeable in behaviour.** They serve identical bytes, but `de` advertises
+`Accept-Ranges` and then ignores a `Range` header on `.dat` files, answering `200` with the whole
+body instead of `206`. Directory listings are sent chunked with no `Content-Length` at all. Both are
+handled: a partial file is never appended to a full-body response, and an interrupted download picks
+between resuming on a mirror that honours ranges and restarting on a faster one, whichever finishes
+sooner.
 
 ## Credits
 
 The archive, the original C++ extractor and the depot key table come from the terarelease dump.
 Please mirror and seed it.
 
-The depot names come from [dr3murr/steam2-winfsp](https://github.com/dr3murr/steam2-winfsp), whose
+Depot names come from [dr3murr/steam2-winfsp](https://github.com/dr3murr/steam2-winfsp), whose
 [`data/depot_labels.tsv`](https://github.com/dr3murr/steam2-winfsp/blob/main/data/depot_labels.tsv)
-puts a real product name on 9 877 of the 10 876 depots here. That is painstaking work and it is what
-makes the archive searchable — a manifest only ever yields folder names like `cstrike` or
-`platform`. Depots it marks `Unknown / No Depot` fall through to this app's own naming passes.
+puts a real product name on 10 870 of the 10 876 depots here. That is painstaking work and it is
+what makes the archive searchable at all — a manifest only ever yields folder names like `cstrike`
+or `platform`. Depots it marks `Unknown / No Depot` fall through to this app's own naming passes,
+which read the manifest inside each blob and ask the Steam store about each depot id.

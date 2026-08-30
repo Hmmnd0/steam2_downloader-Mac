@@ -15,6 +15,46 @@ public sealed class Settings
     public bool Failover { get; set; } = true;
 
     public int Concurrency { get; set; } = 8;
+
+    /// <summary>
+    /// Download in two phases — every blob first, then every dat — each with its own stream count.
+    /// Blobs are kilobytes, so many at once costs nothing; dats are large and the mirrors ramp a
+    /// connection up over time, so only a couple of sustained streams are used for them.
+    /// Turn off to fall back to <see cref="Concurrency"/> parallel files and ranged segments.
+    /// </summary>
+    public bool PhasedDownloads { get; set; } = true;
+
+    /// <summary>Streams used during the blob phase. They are tiny, so latency dominates.</summary>
+    public int BlobConcurrency { get; set; } = 32;
+
+    /// <summary>
+    /// Streams used during the dat phase. Kept low on purpose: these mirrors start a connection
+    /// slow and speed it up while it keeps asking, so many parallel streams all sit at the cold rate.
+    /// </summary>
+    public int DatConcurrency { get; set; } = 2;
+
+    /// <summary>
+    /// How many dats ahead to touch with a one-byte request when a download starts, so the mirror
+    /// has the next files ready. 0 disables it. Fire-and-forget, so it cannot slow anything down.
+    /// </summary>
+    public int WarmupLookahead { get; set; } = 2;
+
+    /// <summary>
+    /// Dats at least this large are fetched one at a time, after the smaller ones. Two concurrent
+    /// long sequential reads make disk-backed storage seek between them, which costs more than the
+    /// parallelism gains; short reads never get far enough for that to matter. 0 disables the split.
+    /// </summary>
+    public long BigFileBytes { get; set; } = 30_000_000L;
+
+    /// <summary>
+    /// Byte length of the last successful dats/ and blobs/ listing fetch, so the next one can show
+    /// a real percentage. nginx builds these listings on the fly and sends them chunked with no
+    /// Content-Length, so the size of the previous fetch is the only total available. The seeded
+    /// figures are a measured estimate and are replaced by exact values after the first run.
+    /// </summary>
+    public long DatListingBytes { get; set; } = 21_000_000L;
+
+    public long BlobListingBytes { get; set; } = 21_000_000L;
     public bool VerifyHashes { get; set; } = true;
     public int TorrentPort { get; set; }
 
@@ -86,6 +126,10 @@ public sealed class Settings
         if (string.IsNullOrWhiteSpace(s.IndexDir)) s.IndexDir = Path.Combine(root, "index");
         if (string.IsNullOrWhiteSpace(s.ExtractOutDir)) s.ExtractOutDir = Path.Combine(root, "extracted");
         if (s.Concurrency is < 1 or > 64) s.Concurrency = 8;
+        if (s.BlobConcurrency is < 1 or > 128) s.BlobConcurrency = 32;
+        if (s.DatConcurrency is < 1 or > 64) s.DatConcurrency = 2;
+        if (s.WarmupLookahead is < 0 or > 16) s.WarmupLookahead = 2;
+        if (s.BigFileBytes < 0) s.BigFileBytes = 30_000_000L;
         if (s.TorrentPort is < 0 or > 65535) s.TorrentPort = 0;
         return s;
     }

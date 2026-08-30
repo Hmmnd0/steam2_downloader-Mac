@@ -26,8 +26,12 @@ public static class ManifestFormat
         uint FileCount,
         IReadOnlyList<string> Roots);
 
-    /// <summary>A manifest entry. Flags == 0 marks a directory, which has no data to extract.</summary>
-    public readonly record struct Node(uint FileId, uint Flags, string Path);
+    /// <summary>
+    /// A manifest entry. Flags == 0 marks a directory, which has no data to extract.
+    /// Size comes from u32CountOrSize, which holds the file's length at this version — checked
+    /// against the file id table, which agrees on every id the two share.
+    /// </summary>
+    public readonly record struct Node(uint FileId, uint Flags, string Path, long Size);
 
     public sealed record ManifestTree(uint AppId, uint VerId, IReadOnlyList<Node> Nodes);
 
@@ -113,6 +117,7 @@ public static class ManifestFormat
         int stringTable = (int)nodesEnd;
 
         var nameOffsets = new uint[nodeCount];
+        var sizes = new uint[nodeCount];
         var fileIds = new uint[nodeCount];
         var flags = new uint[nodeCount];
         var parents = new uint[nodeCount];
@@ -121,6 +126,7 @@ public static class ManifestFormat
         {
             int at = HeaderSize + (int)i * NodeSize;
             nameOffsets[i] = BinaryPrimitives.ReadUInt32LittleEndian(m.AsSpan(at));
+            sizes[i] = BinaryPrimitives.ReadUInt32LittleEndian(m.AsSpan(at + 4));
             fileIds[i] = BinaryPrimitives.ReadUInt32LittleEndian(m.AsSpan(at + 8));
             flags[i] = BinaryPrimitives.ReadUInt32LittleEndian(m.AsSpan(at + 12));
             parents[i] = BinaryPrimitives.ReadUInt32LittleEndian(m.AsSpan(at + 16));
@@ -144,7 +150,7 @@ public static class ManifestFormat
             }
 
             parts.Reverse();
-            nodes.Add(new Node(fileIds[i], flags[i], string.Join('/', parts)));
+            nodes.Add(new Node(fileIds[i], flags[i], string.Join('/', parts), sizes[i]));
         }
 
         return new ManifestTree(appId, verId, nodes);

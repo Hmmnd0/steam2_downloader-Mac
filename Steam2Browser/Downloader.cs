@@ -49,7 +49,7 @@ public sealed class DownloadJob
     }
 }
 
-public sealed class DownloadManager(ArchiveClient client, Settings settings, TorrentSource torrent)
+public sealed class DownloadManager(ArchiveClient client, Settings settings, TorrentSource torrent, ChangeIndex changes)
 {
     private readonly ConcurrentDictionary<string, DownloadJob> _jobs = new();
     private int _seq;
@@ -118,22 +118,66 @@ public sealed class DownloadManager(ArchiveClient client, Settings settings, Tor
             job.Say($"{ordered.Count} file(s) are not in the torrent — fetching those over HTTP");
         }
 
-        var tasks = ordered.Select(async pf =>
-        {
-            await gate.WaitAsync(ct);
-            try
-            {
-                await OneFileAsync(job, pf, ct);
-            }
-            finally
-            {
-                gate.Release();
-            }
-        });
-
         try
         {
-            await Task.WhenAll(tasks);
+            if (settings.PhasedDownloads)
+            {
+                // Two phases, each with its own stream count. Blobs are kilobytes, so latency
+                // dominates and many at once is free. Dats are large and these mirrors speed a
+                // connection up the longer it keeps asking, so only a couple of streams are used —
+                // more of them, or one file split into ranges, all sit at the cold starting rate.
+                var blobs = ordered.Where(f => f.Entry.Kind == Kind.Blob).ToList();
+                var dats = ordered.Where(f => f.Entry.Kind == Kind.Dat).ToList();
+
+                int blobStreams = Math.Max(1, settings.BlobConcurrency);
+                int datStreams = Math.Max(1, settings.DatConcurrency);
+
+                job.Say($"phased: {blobs.Count} blob(s) at {blobStreams} stream(s), " +
+                        $"then {dats.Count} dat(s) at {datStreams} stream(s)");
+
+                // Only the dat phase warms ahead. Blobs are kilobytes and already run 32 at a
+                // time, so there is nothing to hide the latency of.
+                await OnePhaseAsync(job, blobs, "blobs", blobStreams, warmAhead: false, ct);
+
+                // Every blob is on disk now, which is the first moment the question can be answered:
+                // a dat whose every written file was overwritten again further up the chain holds
+                // nothing this version reads. For a depot where one binary churns and the rest sits
+                // still, that is almost the entire chain.
+                dats = PruneDats(job, blobs, dats);
+
+                // Large dats go last and alone. Two concurrent long sequential reads make
+                // disk-backed storage seek between them; small files finish before that bites,
+                // so they keep the configured parallelism.
+                long bigFrom = settings.BigFileBytes;
+                if (bigFrom > 0)
+                {
+                    // An unknown size is treated as large: better a slower download than a
+                    // multi-gigabyte file competing with another one.
+                    var small = dats.Where(f => f.Size >= 0 && f.Size < bigFrom).ToList();
+                    var big = dats.Where(f => f.Size < 0 || f.Size >= bigFrom).ToList();
+
+                    if (big.Count > 0)
+                        job.Say($"{big.Count} dat(s) at or above {bigFrom / 1_000_000} MB " +
+                                $"will be fetched one at a time");
+
+                    await OnePhaseAsync(job, small, "small dats", datStreams, warmAhead: true, ct);
+                    await OnePhaseAsync(job, big, "large dats", 1, warmAhead: true, ct);
+                }
+                else
+                {
+                    await OnePhaseAsync(job, dats, "dats", datStreams, warmAhead: true, ct);
+                }
+            }
+            else
+            {
+                await Task.WhenAll(ordered.Select(async pf =>
+                {
+                    await gate.WaitAsync(ct);
+                    try { await OneFileAsync(job, pf, ct); }
+                    finally { gate.Release(); }
+                }));
+            }
+
             Finish(job);
         }
         catch (OperationCanceledException)
@@ -153,6 +197,78 @@ public sealed class DownloadManager(ArchiveClient client, Settings settings, Tor
             job.SpeedBps = 0;
             job.Active.Clear();
         }
+    }
+
+    /// <summary>Runs one kind of file to completion before the caller moves on to the next phase.</summary>
+    /// <summary>
+    /// Drops the dats no file in the target version resolves to. Answered from the blobs just
+    /// downloaded, so it costs nothing; returns the list untouched whenever the answer cannot be
+    /// established, because skipping a dat that is genuinely needed breaks the extraction.
+    /// </summary>
+    private List<PlanFile> PruneDats(DownloadJob job, List<PlanFile> blobs, List<PlanFile> dats)
+    {
+        var chainBlobs = blobs.Select(f => f.Entry).ToList();
+
+        var target = chainBlobs
+            .Where(b => b.Version == job.Version)
+            .FirstOrDefault(b => job.BlobCrc is null
+                                 || b.CrcHex.Equals(job.BlobCrc, StringComparison.OrdinalIgnoreCase));
+
+        if (target is null) return dats;
+
+        var needed = changes.NeededDatVersions(chainBlobs, target);
+        if (needed is null) return dats;
+
+        var keep = needed.ToHashSet();
+        var kept = dats.Where(f => keep.Contains(f.Entry.Version)).ToList();
+        int dropped = dats.Count - kept.Count;
+
+        if (dropped == 0) return dats;
+
+        long saved = dats.Where(f => !keep.Contains(f.Entry.Version)).Sum(f => Math.Max(0, f.Size));
+        job.Say($"{dropped} of {dats.Count} dat(s) hold nothing version {job.Version} reads — "
+                + $"skipping them saves {saved / 1_000_000} MB");
+
+        job.TotalFiles -= dropped;
+        return kept;
+    }
+
+    private async Task OnePhaseAsync(
+        DownloadJob job, List<PlanFile> files, string what, int streams, bool warmAhead, CancellationToken ct)
+    {
+        if (files.Count == 0) return;
+
+        int lookahead = warmAhead ? Math.Max(0, settings.WarmupLookahead) : 0;
+
+        job.Say($"{what}: {files.Count} file(s), {streams} stream(s)"
+                + (lookahead > 0 ? $", warming {lookahead} ahead" : ""));
+
+        using var gate = new SemaphoreSlim(streams);
+
+        await Task.WhenAll(files.Select(async (pf, index) =>
+        {
+            await gate.WaitAsync(ct);
+            try
+            {
+                if (lookahead > 0) WarmAhead(files, index + lookahead, ct);
+                await OneFileAsync(job, pf, ct);
+            }
+            finally { gate.Release(); }
+        }));
+    }
+
+    /// <summary>
+    /// Touches an upcoming file so the mirror can have it ready. Deliberately not awaited: the point
+    /// is only that the request reaches the mirror, and its outcome never affects this download.
+    /// </summary>
+    private void WarmAhead(List<PlanFile> files, int index, CancellationToken ct)
+    {
+        if (index < 0 || index >= files.Count) return;
+
+        var entry = files[index].Entry;
+        if (File.Exists(Path.Combine(settings.DataDir, entry.DirName, entry.FileName))) return;
+
+        _ = client.WarmAsync(entry, ct);
     }
 
     private static void Finish(DownloadJob job)

@@ -30,14 +30,18 @@ var client = new ArchiveClient(http)
 {
     Primary = Mirrors.ById(settings.MirrorId),
     Failover = settings.Failover,
+    UseSegments = !settings.PhasedDownloads,
 };
 var loader = new IndexLoader(client, settings);
 var torrent = new TorrentSource(settings);
-var downloads = new DownloadManager(client, settings, torrent);
+// Built before the download manager, which uses it to work out which dats a chain really needs.
+var changes = new ChangeIndex(client, settings);
+var downloads = new DownloadManager(client, settings, torrent, changes);
 var extractor = new ExtractorRunner(settings);
 var updates = new UpdateChecker(http);
 updates.Initialise();
 var labels = new LabelSource(http);
+var fileSearch = new FileSearch(settings);
 var names = new NameCache(client, http, labels);
 names.Load(Settings.RootFor(baseDir));
 
@@ -81,10 +85,71 @@ if (buildIndexAt >= 0)
         cat.Ordered.SelectMany(d => d.Dats),
         cat.Ordered.SelectMany(d => d.Blobs));
 
-    Console.WriteLine($"  wrote {outPath} ({new FileInfo(outPath).Length / 1048576.0:0.00} MB) " +
+    Console.WriteLine($"  wrote {outPath} ({new FileInfo(outPath).Length / 1_000_000.0:0.00} MB) " +
                       $"— {cat.Ordered.Count} depots, {cat.DatCount + cat.BlobCount} files" +
                       (cat.SizesLoaded ? ", with sizes" : ", no sizes"));
     return 0;
+}
+
+// ---------------- port ----------------
+
+// Kestrel only discovers a busy port deep inside app.Run(), where the failure surfaces as a wall
+// of stack trace. Settle it here instead: hand the user over to an instance that is already
+// running, or step aside to the next free port.
+static bool PortIsFree(int candidate)
+{
+    try
+    {
+        var probe = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, candidate);
+        probe.Start();
+        probe.Stop();
+        return true;
+    }
+    catch (System.Net.Sockets.SocketException)
+    {
+        return false;
+    }
+}
+
+static async Task<bool> AnotherInstanceAsync(int candidate)
+{
+    try
+    {
+        using var probe = new HttpClient { Timeout = TimeSpan.FromSeconds(2) };
+        var body = await probe.GetStringAsync($"http://127.0.0.1:{candidate}/api/state");
+        return body.Contains("\"mirrors\"", StringComparison.Ordinal);
+    }
+    catch
+    {
+        return false;
+    }
+}
+
+if (!PortIsFree(port))
+{
+    if (await AnotherInstanceAsync(port))
+    {
+        string running = $"http://127.0.0.1:{port}/";
+        Console.WriteLine($"steam2browser is already running at {running} — opening that one");
+
+        if (!noBrowser)
+        {
+            try { Process.Start(new ProcessStartInfo(running) { UseShellExecute = true }); }
+            catch { /* the URL is printed above */ }
+        }
+        return 0;
+    }
+
+    int free = Enumerable.Range(port + 1, 20).FirstOrDefault(PortIsFree, -1);
+    if (free < 0)
+    {
+        Console.Error.WriteLine($"port {port} is taken and nothing is free through {port + 20}.");
+        Console.Error.WriteLine("Pass --port=NNNN to choose another one.");
+        return 1;
+    }
+
+    Console.WriteLine($"port {port} is taken by something else — using {free}");
+    port = free;
 }
 
 var builder = WebApplication.CreateBuilder(new WebApplicationOptions { Args = args, ContentRootPath = baseDir });
@@ -139,6 +204,11 @@ app.MapGet("/api/state", () => new
         settings.MirrorId,
         settings.Failover,
         settings.Concurrency,
+        settings.PhasedDownloads,
+        settings.BlobConcurrency,
+        settings.DatConcurrency,
+        settings.WarmupLookahead,
+        settings.BigFileBytes,
         settings.VerifyHashes,
         settings.TorrentPort,
         settings.ExtractOutDir,
@@ -182,6 +252,16 @@ app.MapGet("/api/state", () => new
         names.Status.Remaining,
         names.Status.Message,
     },
+    fileSearch = new
+    {
+        fileSearch.Status.Running,
+        fileSearch.Status.DepotsIndexed,
+        fileSearch.Status.DepotsToIndex,
+        fileSearch.Status.PathCount,
+        fileSearch.Status.Capped,
+        fileSearch.Status.BuiltUtc,
+        fileSearch.Status.Message,
+    },
     torrent = new
     {
         torrent.Status.State,
@@ -217,6 +297,15 @@ app.MapPost("/api/settings", async (SettingsPatch patch) =>
     if (patch.MirrorId is { } mid) { settings.MirrorId = mid; client.Primary = Mirrors.ById(mid); }
     if (patch.Failover is { } fo) { settings.Failover = fo; client.Failover = fo; }
     if (patch.Concurrency is { } cc) settings.Concurrency = Math.Clamp(cc, 1, 64);
+    if (patch.PhasedDownloads is { } phased)
+    {
+        settings.PhasedDownloads = phased;
+        client.UseSegments = !phased;
+    }
+    if (patch.BlobConcurrency is { } bc) settings.BlobConcurrency = Math.Clamp(bc, 1, 128);
+    if (patch.DatConcurrency is { } dc) settings.DatConcurrency = Math.Clamp(dc, 1, 64);
+    if (patch.WarmupLookahead is { } wl) settings.WarmupLookahead = Math.Clamp(wl, 0, 16);
+    if (patch.BigFileMb is { } bm) settings.BigFileBytes = Math.Max(0, bm) * 1_000_000L;
     if (patch.VerifyHashes is { } vh) settings.VerifyHashes = vh;
     if (patch.TorrentPort is { } tp)
     {
@@ -334,7 +423,7 @@ app.MapGet("/api/depots", (string? q, string? sort, string? dir, string? filter,
         "reset" => items.Where(d => d.HasReset),
         "incomplete" => items.Where(d => !d.IsComplete),
         "single" => items.Where(d => d.DistinctVersions == 1),
-        "big" => items.Where(d => d.ApproxDatBytes >= 1L << 30),
+        "big" => items.Where(d => d.ApproxDatBytes >= 1_000_000_000L),
         _ => items,
     };
 
@@ -387,6 +476,237 @@ app.MapGet("/api/depots/{id:int}", (int id) =>
     });
 });
 
+// The whole version history of a depot, newest first. Counts appear for versions whose blob is
+// already on disk; the rest need the bulk fetch below, which costs kilobytes per version.
+app.MapGet("/api/depots/{id:int}/versions", (int id) =>
+{
+    var cat = loader.Catalog;
+    if (cat is null || !cat.Depots.TryGetValue(id, out var depot)) return Results.NotFound();
+
+    var fetch = changes.StatusFor(id);
+    var (branches, _) = changes.Branches(depot);
+
+    return Results.Ok(new
+    {
+        depot = id,
+        fetch = new { fetch.Running, fetch.Done, fetch.Total, fetch.Failed, fetch.Message },
+        branches = branches.Select(b => new
+        {
+            b.Index, b.HeadCrc, b.MinVersion, b.MaxVersion,
+            b.FirstDate, b.LastDate, b.BlobCount, b.ForksFromVersion,
+        }),
+        versions = changes.Summary(depot).Select(v =>
+        {
+            // Direct links to the mirror so the browser can save a single file without going
+            // through the download queue. The swarm has no URL, so those fall back to a real host.
+            var host = client.Primary.IsTorrent ? Mirrors.All[0] : client.Primary;
+
+            var blob = depot.Blobs.FirstOrDefault(b => b.Version == v.Version && b.CrcHex == v.Crc);
+            var dat = blob is null ? null : changes.DatFor(depot, blob);
+
+            return new
+            {
+                v.Version, v.Crc, v.Date, v.Local, v.Branch,
+                v.AddedCount, v.ChangedCount, v.RemovedCount,
+                v.PayloadBytes, v.DeltaBytes, v.FilesInVersion, v.Unclassified, v.Error,
+                blobUrl = blob is null ? null : host.Url(blob.RelPath),
+                blobBytes = blob?.ApproxSize ?? -1,
+                datUrl = dat is null ? null : host.Url(dat.RelPath),
+                datBytes = dat?.ApproxSize ?? -1,
+            };
+        }),
+    });
+});
+
+// The files one version changed. Read straight from that version's blob, no dat involved.
+app.MapGet("/api/depots/{id:int}/versions/{version:int}/files", (int id, int version, string? crc) =>
+{
+    var cat = loader.Catalog;
+    if (cat is null || !cat.Depots.TryGetValue(id, out var depot)) return Results.NotFound();
+
+    var candidates = depot.Blobs.Where(b => b.Version == version).ToList();
+    var blob = !string.IsNullOrWhiteSpace(crc)
+        ? candidates.FirstOrDefault(b => b.CrcHex.Equals(crc.Trim(), StringComparison.OrdinalIgnoreCase))
+        : candidates.FirstOrDefault();
+
+    if (blob is null) return Results.Ok(new { error = $"no blob for version {version}" });
+
+    try
+    {
+        var result = changes.Diff(depot, blob);
+        if (result is null) return Results.Ok(new { needsFetch = true, crc = blob.CrcHex });
+
+        var (files, unclassified) = result.Value;
+
+        return Results.Ok(new
+        {
+            version,
+            crc = blob.CrcHex,
+            count = files.Count,
+            unclassified,
+            files = files.Take(20000).Select(f => new
+            {
+                path = f.Path,
+                size = f.Size,
+                delta = f.Delta,
+                mode = f.Mode,
+                change = f.Change,
+            }),
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Ok(new { error = ex.Message });
+    }
+});
+
+// Blobs for a whole span of depot ids at once — enough to browse history and search files
+// across a chunk of the archive without paying for any dat.
+// Same-origin relay for the browser-side chain download. The mirrors send no
+// Access-Control-Allow-Origin and answer OPTIONS with 405, so a page cannot read them across
+// origins at all — it has to ask us, and we stream the bytes straight through. A copy already on
+// disk is served from there instead of being pulled a second time.
+app.MapGet("/api/file/{dir}/{name}", async (string dir, string name, CancellationToken ct) =>
+{
+    if (dir is not ("blobs" or "dats")) return Results.BadRequest(new { error = "unknown folder" });
+
+    // The name comes back to us from our own plan, but it still ends up in a path.
+    if (name.Length == 0 || name.Contains('/') || name.Contains('\\') || name.Contains(".."))
+        return Results.BadRequest(new { error = "bad file name" });
+
+    string local = Path.Combine(settings.DataDir, dir, name);
+    if (System.IO.File.Exists(local))
+        return Results.File(local, "application/octet-stream", name);
+
+    var host = client.Primary.IsTorrent ? Mirrors.All[0] : client.Primary;
+    var upstream = await http.GetAsync(host.Url($"{dir}/{name}"),
+                                       HttpCompletionOption.ResponseHeadersRead, ct);
+
+    if (!upstream.IsSuccessStatusCode)
+        return Results.StatusCode((int)upstream.StatusCode);
+
+    return Results.Stream(await upstream.Content.ReadAsStreamAsync(ct),
+                          "application/octet-stream", name);
+});
+
+Dto.PlanHost = () => client.Primary;
+
+// How much of a chain's dat traffic is actually dead weight. Answered from blobs alone, so it
+// costs nothing but the blobs that browsing the depot already needs.
+app.MapGet("/api/depots/{id:int}/needed", (int id, int version) =>
+{
+    if (loader.Catalog is null) return Results.BadRequest(new { error = "index not loaded yet" });
+
+    var depot = loader.Catalog.Ordered.FirstOrDefault(d => d.Id == id);
+    if (depot is null) return Results.NotFound(new { error = "no such depot" });
+
+    var chainBlobs = depot.Blobs.Where(b => b.Version <= version)
+                                .OrderBy(b => b.Version)
+                                .ToList();
+
+    var target = chainBlobs.LastOrDefault(b => b.Version == version);
+    if (target is null) return Results.NotFound(new { error = "no blob at that version" });
+
+    var needed = changes.NeededDatVersions(chainBlobs, target);
+    if (needed is null)
+        return Results.Ok(new { resolved = false, reason = "not every blob is on disk, or an id is unaccounted for" });
+
+    var datsByVersion = depot.Dats.Where(d => d.Version <= version)
+                                  .GroupBy(d => d.Version)
+                                  .ToDictionary(g => g.Key, g => g.First());
+
+    long full = datsByVersion.Values.Sum(d => Math.Max(0, d.ApproxSize));
+    long slim = needed.Where(datsByVersion.ContainsKey)
+                      .Sum(v => Math.Max(0, datsByVersion[v].ApproxSize));
+
+    return Results.Ok(new
+    {
+        resolved = true,
+        chainVersions = datsByVersion.Count,
+        neededVersions = needed.Count,
+        needed,
+        fullBytes = full,
+        neededBytes = slim,
+    });
+});
+
+app.MapPost("/api/blobs/range", (BlobRangeRequest req) =>
+{
+    if (loader.Catalog is null) return Results.BadRequest(new { error = "index not loaded yet" });
+
+    changes.FetchRange(loader.Catalog, req.From, req.To);
+    return Results.Ok(new { ok = true });
+});
+
+app.MapGet("/api/blobs/range", (int? from, int? to) =>
+{
+    var st = changes.RangeStatus;
+    object? preview = null;
+
+    if (from is { } f && to is { } t && loader.Catalog is { } cat)
+    {
+        int lo = Math.Min(f, t), hi = Math.Max(f, t);
+        var span = cat.Ordered.Where(d => d.Id >= lo && d.Id <= hi).ToList();
+        var blobs = span.SelectMany(d => d.Blobs).ToList();
+        int missing = blobs.Count(b => !changes.HasLocal(b));
+
+        preview = new
+        {
+            depots = span.Count,
+            blobs = blobs.Count,
+            missing,
+            bytes = blobs.Where(b => b.ApproxSize > 0).Sum(b => b.ApproxSize),
+        };
+    }
+
+    return Results.Ok(new { st.Running, st.Done, st.Total, st.Failed, st.Message, preview });
+});
+
+// Pulls every blob the depot has, so the full history can be expanded offline.
+app.MapPost("/api/depots/{id:int}/blobs", (int id) =>
+{
+    var cat = loader.Catalog;
+    if (cat is null || !cat.Depots.TryGetValue(id, out var depot)) return Results.NotFound();
+
+    changes.FetchAll(depot);
+    return Results.Ok(new { ok = true, blobs = depot.Blobs.Count });
+});
+
+// Builds the path index over blobs already on disk. Nothing is downloaded for it.
+app.MapPost("/api/files/index", () =>
+{
+    if (loader.Catalog is null) return Results.BadRequest(new { error = "index not loaded yet" });
+    fileSearch.Build(loader.Catalog);
+    return Results.Ok(new { ok = true });
+});
+
+// Finds a file path anywhere in the depots whose blobs have been fetched.
+app.MapGet("/api/files/search", (string? q, int? limit) =>
+{
+    if (string.IsNullOrWhiteSpace(q)) return Results.Ok(new { hits = Array.Empty<object>(), total = 0 });
+
+    int cap = Math.Clamp(limit is null or <= 0 ? 300 : limit.Value, 1, 2000);
+    var hits = fileSearch.Search(q, cap);
+
+    return Results.Ok(new
+    {
+        indexed = fileSearch.Status.PathCount,
+        depots = fileSearch.Status.DepotsIndexed,
+        running = fileSearch.Status.Running,
+        // Blobs downloaded since the index was built are invisible to a search until it is redone,
+        // which is worth saying out loud rather than letting the results look complete.
+        blobsIndexed = fileSearch.Status.BlobsIndexed,
+        blobsOnDisk = fileSearch.BlobsOnDisk(),
+        truncated = hits.Count >= cap,
+        hits = hits.Select(h => new
+        {
+            depot = h.Depot,
+            path = h.Path,
+            name = names.DisplayFor(h.Depot),
+        }),
+    });
+});
+
 app.MapGet("/api/search", (string? q, int? take) =>
 {
     var cat = loader.Catalog;
@@ -418,6 +738,7 @@ app.MapPost("/api/plan", async (PlanRequest req, CancellationToken ct) =>
     if (cat is null) return Results.BadRequest(new { error = "index not loaded yet" });
 
     var plan = await ChainResolver.ResolveAsync(cat, client, settings.DataDir, req.Depot, req.Version, req.BlobCrc, ct);
+    changes.Prune(plan);
     return Results.Ok(Dto.Plan(plan, settings));
 });
 
@@ -427,6 +748,7 @@ app.MapPost("/api/download", async (PlanRequest req, CancellationToken ct) =>
     if (cat is null) return Results.BadRequest(new { error = "index not loaded yet" });
 
     var plan = await ChainResolver.ResolveAsync(cat, client, settings.DataDir, req.Depot, req.Version, req.BlobCrc, ct);
+    changes.Prune(plan);
     if (plan.Error is not null || plan.NeedsChoice) return Results.Ok(Dto.Plan(plan, settings));
 
     var job = downloads.Start(plan);
@@ -493,11 +815,23 @@ app.MapPost("/api/reveal", (RevealRequest req) =>
 _ = updates.CheckAsync();
 
 // Startup: load the index, race the mirrors, switch to the fastest, then start naming depots.
+// Refreshing the curated names is deliberately off the startup path: raw.githubusercontent.com is
+// blocked on some networks and does not fail fast, so awaiting it used to hold the whole UI for the
+// length of the fetch timeout before anything could be drawn.
 _ = Task.Run(async () =>
 {
-    // Curated names first: they cover the whole archive today, which means both sweeps below
-    // usually find nothing left to do and no blob or store request is made at all.
-    await labels.LoadAsync(Settings.RootFor(baseDir));
+    await labels.RefreshAsync(Settings.RootFor(baseDir));
+    names.Refresh();
+});
+
+_ = Task.Run(async () =>
+{
+    // Cached curated names first: they cover the whole archive today, which means both sweeps
+    // below usually find nothing left to do and no blob or store request is made at all. This
+    // reads a local file only — refreshing them from GitHub is a separate task started below,
+    // because that fetch can sit on an unreachable host for the whole timeout and the index is
+    // the one thing the UI cannot render without.
+    await labels.LoadCachedAsync(Settings.RootFor(baseDir));
     names.Refresh();
 
     await loader.LoadAsync(refreshIndex: false, withSizes: true);
@@ -536,17 +870,29 @@ if (!noBrowser)
     catch { /* headless is fine, the URL is printed above */ }
 }
 
-app.Run();
+try
+{
+    app.Run();
+}
+catch (IOException ex)
+{
+    // Something grabbed the port between the probe above and Kestrel binding it.
+    Console.Error.WriteLine($"could not start on port {port}: {ex.Message}");
+    Console.Error.WriteLine("Pass --port=NNNN to choose another one.");
+    return 1;
+}
+
 return 0;
 
 // ---------------- request bodies ----------------
 
 internal sealed record SettingsPatch(
-    string? MirrorId, bool? Failover, int? Concurrency, bool? VerifyHashes,
+    string? MirrorId, bool? Failover, int? Concurrency, bool? VerifyHashes, bool? PhasedDownloads, int? BlobConcurrency, int? DatConcurrency, int? WarmupLookahead, int? BigFileMb,
     int? TorrentPort, string? DataDir, string? ExtractOutDir, string[]? ExtraTrackers);
 
 internal sealed record ReloadRequest(bool Refresh, bool Sizes);
 internal sealed record PlanRequest(int Depot, int Version, string? BlobCrc);
+internal sealed record BlobRangeRequest(int From, int To);
 internal sealed record ExtractRequest(int Depot, int Version, string? BlobCrc, string? Filter, string? KeyHex);
 internal sealed record RevealRequest(string Path);
 
@@ -612,6 +958,10 @@ internal static class Dto
         alreadyLocal = p.Files.Count(f =>
             System.IO.File.Exists(Path.Combine(s.DataDir, f.Entry.DirName, f.Entry.FileName))),
         extractArgs = p.ExtractArgs,
+        // Null when it could not be worked out yet, which the UI reports rather than hiding.
+        skippedDats = p.SkippedDats,
+        skippedBytes = p.SkippedBytes,
+        chainDats = p.ChainDats,
         files = p.Files.Take(2000).Select(f => new
         {
             name = f.Entry.FileName,
@@ -621,8 +971,16 @@ internal static class Dto
             size = f.Size,
             exact = f.SizeExact,
             local = System.IO.File.Exists(Path.Combine(s.DataDir, f.Entry.DirName, f.Entry.FileName)),
+            // Subfolder and absolute URL, so a browser-side download can lay the chain out the
+            // same way the app does and fetch it without going through the queue. The swarm has
+            // no URL of its own, so that mirror falls back to a real host.
+            dir = f.Entry.DirName,
+            url = (PlanHost().IsTorrent ? Mirrors.All[0] : PlanHost()).Url(f.Entry.RelPath),
         }),
     };
+
+    /// <summary>Set once at startup; the DTO needs a mirror to build absolute file URLs.</summary>
+    public static Func<Mirror> PlanHost = () => Mirrors.All[0];
 
     public static object Job(DownloadJob j) => new
     {

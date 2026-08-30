@@ -52,25 +52,29 @@ public sealed class LabelSource(HttpClient http)
     public int Count => _labels.Count;
 
     /// <summary>
-    /// Uses the cached copy immediately when there is one, then refreshes from GitHub in the
-    /// background so a slow or blocked connection never delays startup.
+    /// Reads the cached copy and nothing else. Local file access only, so it cannot hold up
+    /// startup — the GitHub refresh is a separate call precisely because it can.
     /// </summary>
-    public async Task LoadAsync(string dataDir, CancellationToken ct = default)
+    public async Task LoadCachedAsync(string dataDir, CancellationToken ct = default)
     {
         string cachePath = Path.Combine(dataDir, CacheFile);
+        if (!File.Exists(cachePath)) return;
 
-        if (File.Exists(cachePath))
+        try
         {
-            try
-            {
-                Apply(await File.ReadAllTextAsync(cachePath, ct), "cache");
-            }
-            catch
-            {
-                // A damaged cache just means fetching again.
-            }
+            Apply(await File.ReadAllTextAsync(cachePath, ct), "cache");
         }
+        catch
+        {
+            // A damaged cache just means fetching again.
+        }
+    }
 
+    /// <summary>Cached copy first, then a refresh from GitHub. Only for callers that are not on
+    /// the startup path: the refresh can block for the whole fetch timeout.</summary>
+    public async Task LoadAsync(string dataDir, CancellationToken ct = default)
+    {
+        await LoadCachedAsync(dataDir, ct);
         await RefreshAsync(dataDir, ct);
     }
 
@@ -81,7 +85,10 @@ public sealed class LabelSource(HttpClient http)
 
         try
         {
-            string? tsv = await FetchRawAsync(ct) ?? await FetchViaApiAsync(ct);
+            // The API endpoint answers in about a second, while raw.githubusercontent.com is blocked
+            // outright on some networks and only fails once the timeout runs out. Ask the fast one
+            // first and keep raw as the fallback for where the API is the blocked one.
+            string? tsv = await FetchViaApiAsync(ct) ?? await FetchRawAsync(ct);
             if (tsv is null)
             {
                 if (_labels.Count == 0)

@@ -73,9 +73,13 @@ public sealed class Steam2Extractor
                 dats[v] = list[0].Path;
             }
 
+            // Every blob is required: the file id table is assembled from all of them. A dat is not,
+            // because a version whose writes were all superseded contributes nothing to this target.
+            // Which dats genuinely matter is only knowable once that table exists, so the check for
+            // a missing one that is actually referenced happens in ExtractAsync.
             for (int v = version; v >= 0; v--)
-                if (!dats.ContainsKey(v) || !blobs.ContainsKey(v))
-                    throw new InvalidDataException($"missing a dat or blob for version {v}");
+                if (!blobs.ContainsKey(v))
+                    throw new InvalidDataException($"missing a blob for version {v}");
 
             return new Chain(dats, blobs);
         }
@@ -96,13 +100,16 @@ public sealed class Steam2Extractor
             var info = BlobFormat.Parse(File.ReadAllBytes(current.Path));
 
             if (!datFiles.TryGetValue(at, out var candidates) || candidates.Count == 0)
-                throw new InvalidDataException($"no dat for version {at}");
+            {
+                // Not fatal here — see the note above. The walk follows blobs, not dats.
+                candidates = [];
+            }
 
             if (candidates.Count == 1)
             {
                 dats[at] = candidates[0].Path;
             }
-            else
+            else if (candidates.Count > 1)
             {
                 if (info.DatSize is not ulong want)
                     throw new InvalidDataException($"blob at version {at} records no dat size");
@@ -189,11 +196,29 @@ public sealed class Steam2Extractor
             ? null
             : new System.Text.RegularExpressions.Regex(filter, System.Text.RegularExpressions.RegexOptions.Compiled);
 
+        // Only the versions some file in this manifest actually resolves to are needed. For a depot
+        // where one binary is rewritten every version that can be two dats out of a hundred, and the
+        // rest were downloaded — or now, skipped — for nothing.
+        var referenced = new SortedSet<int>();
+        foreach (var node in tree.Nodes)
+        {
+            if (node.Flags == 0) continue;
+            if (fileIds.TryGetValue(node.FileId, out var where)) referenced.Add(where.Part);
+        }
+
+        var absent = referenced.Where(v => !chain.Dats.ContainsKey(v)).ToList();
+        if (absent.Count > 0)
+            throw new InvalidDataException(
+                $"missing the dat for version(s) {string.Join(", ", absent)}, which this version needs");
+
+        log($"dats needed: {referenced.Count} of {chain.Dats.Count} in the chain "
+            + $"({string.Join(", ", referenced.Take(12))}{(referenced.Count > 12 ? ", …" : "")})");
+
         var dats = new Dictionary<int, FileStream>();
         try
         {
-            foreach (var (v, path) in chain.Dats)
-                dats[v] = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20);
+            foreach (var v in referenced)
+                dats[v] = new FileStream(chain.Dats[v], FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20);
 
             var wanted = tree.Nodes
                 .Where(n => n.Flags != 0)

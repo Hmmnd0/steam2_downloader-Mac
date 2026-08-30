@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Text;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
@@ -27,6 +29,92 @@ public sealed class ArchiveClient(HttpClient http)
     /// <summary>When true, a failed request is retried against the remaining mirrors.</summary>
     public bool Failover { get; set; } = true;
 
+    /// <summary>
+    /// Split large dats into parallel ranges. Off by default: these mirrors ramp a connection up
+    /// over time, so every extra range is another cold stream competing with the one that warmed up.
+    /// </summary>
+    public bool UseSegments { get; set; }
+
+    /// <summary>Cap on a warm-up touch. It must never hold anything up, so it gives up quickly.</summary>
+    private static readonly TimeSpan WarmTimeout = TimeSpan.FromSeconds(15);
+
+    /// <summary>
+    /// Asks the mirror for one byte of a file that will be wanted shortly, so the storage has it
+    /// open and cached by the time the real request arrives. Costs a byte plus headers, targets the
+    /// mirror actually in use (no failover), and swallows everything — nothing depends on it.
+    /// </summary>
+    public async Task WarmAsync(Entry entry, CancellationToken ct = default)
+    {
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(WarmTimeout);
+
+            using var req = new HttpRequestMessage(HttpMethod.Get, Primary.Url(entry.RelPath));
+            req.Headers.Range = new RangeHeaderValue(0, 0);
+
+            using var resp = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
+            await resp.Content.CopyToAsync(Stream.Null, timeout.Token);
+        }
+        catch
+        {
+            // Best effort. A failed warm-up is not a failed download.
+        }
+    }
+
+    /// <summary>
+    /// Which mirrors honour a Range request, learned from the answers themselves — no probing.
+    /// It varies by file kind and not only by host: de replies 206 for blobs but plain 200 with
+    /// the whole body for dats, while us honours both.
+    /// </summary>
+    private readonly ConcurrentDictionary<(string Mirror, Kind Kind), bool> _honoursRange = new();
+
+    private bool? HonoursRange(Mirror m, Kind kind) =>
+        _honoursRange.TryGetValue((m.Id, kind), out bool v) ? v : null;
+
+    /// <summary>
+    /// Picks how to continue a partly-downloaded file: resume on a mirror that honours Range, or
+    /// discard the partial and start over on the fastest one.
+    ///
+    /// Starting over sounds like the wasteful choice and often is not. Resuming only saves the
+    /// bytes already on disk; it does nothing for throughput, since a 206 and a 200 stream at the
+    /// same rate over the same connection. So when the fast mirror ignores Range, re-fetching the
+    /// whole file there beats collecting the tail from a slow one — measured here, de runs about
+    /// five times faster than us, which means a restart wins until roughly 80% is already down.
+    /// Both speeds have to be known for that comparison; without them, resuming is the safe pick
+    /// because it can never transfer more than starting over would.
+    /// </summary>
+    private (List<Mirror> Order, long ResumeFrom) PlanResume(Entry entry, long resumeFrom)
+    {
+        var all = Order().ToList();
+        if (resumeFrom <= 0 || all.Count == 0) return (all, resumeFrom);
+
+        // Untried mirrors count as usable: the only way to learn is to ask one.
+        var resumable = all.Where(m => HonoursRange(m, entry.Kind) != false).ToList();
+        if (resumable.Count == all.Count) return (all, resumeFrom);
+
+        // The swarm has no URL to range against, so it takes no part in this comparison.
+        long total = entry.ApproxSize;
+        var fastest = all.Where(m => !m.IsTorrent).MaxBy(m => m.SpeedBps);
+        var bestResume = resumable.Where(m => !m.IsTorrent).MaxBy(m => m.SpeedBps);
+
+        // Nothing can resume, so the partial is worthless whatever happens.
+        if (bestResume is null) return (all, 0);
+
+        if (total <= 0 || fastest is null || fastest.SpeedBps <= 0 || bestResume.SpeedBps <= 0)
+            return (Reordered(all, bestResume), resumeFrom);
+
+        double restartSeconds = total / fastest.SpeedBps;
+        double resumeSeconds = (total - resumeFrom) / bestResume.SpeedBps;
+
+        return resumeSeconds <= restartSeconds
+            ? (Reordered(all, bestResume), resumeFrom)
+            : (Reordered(all, fastest), 0);
+    }
+
+    private static List<Mirror> Reordered(List<Mirror> all, Mirror first) =>
+        [first, .. all.Where(m => m.Id != first.Id)];
+
     private IEnumerable<Mirror> Order()
     {
         yield return Primary;
@@ -48,12 +136,51 @@ public sealed class ArchiveClient(HttpClient http)
         throw last ?? new HttpRequestException($"could not fetch {relPath}");
     }
 
-    public async Task<string> GetStringAsync(string relPath, CancellationToken ct = default)
+    /// <summary>
+    /// Fetches a text resource, optionally reporting bytes as they arrive. The directory listings
+    /// are around 20 MB each, which is long enough that a caller wants to show real progress
+    /// rather than a spinner — so this streams instead of buffering the whole body first.
+    /// The callback gets (bytes so far, total) with total -1 when the server sends no length.
+    /// </summary>
+    public async Task<string> GetStringAsync(string relPath, CancellationToken ct = default,
+                                             Action<long, long>? progress = null)
     {
         Exception? last = null;
         foreach (var m in Order())
         {
-            try { return await http.GetStringAsync(m.Url(relPath), ct); }
+            try
+            {
+                if (progress is null) return await http.GetStringAsync(m.Url(relPath), ct);
+
+                using var resp = await http.GetAsync(m.Url(relPath),
+                                                     HttpCompletionOption.ResponseHeadersRead, ct);
+                resp.EnsureSuccessStatusCode();
+
+                long total = resp.Content.Headers.ContentLength ?? -1;
+                await using var body = await resp.Content.ReadAsStreamAsync(ct);
+
+                var buffer = new byte[128 * 1024];
+                var text = new StringBuilder(total > 0 ? (int)Math.Min(total, int.MaxValue) : 1 << 20);
+                var decoder = Encoding.UTF8.GetDecoder();
+                var chars = new char[buffer.Length + 8];
+                long read = 0;
+
+                while (true)
+                {
+                    int n = await body.ReadAsync(buffer, ct);
+                    if (n == 0) break;
+
+                    // Decoding as it streams keeps a multi-byte character split across two reads
+                    // from turning into replacement characters.
+                    int produced = decoder.GetChars(buffer, 0, n, chars, 0);
+                    text.Append(chars, 0, produced);
+
+                    read += n;
+                    progress(read, total);
+                }
+
+                return text.ToString();
+            }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
             catch (Exception ex) { last = ex; }
         }
@@ -138,8 +265,12 @@ public sealed class ArchiveClient(HttpClient http)
             }
         }
 
+        var (order, planned) = PlanResume(entry, resumeFrom);
+        if (planned == 0 && resumeFrom > 0) TryDelete(partPath);
+        resumeFrom = planned;
+
         Exception? last = null;
-        foreach (var m in Order())
+        foreach (var m in order)
         {
             try
             {
@@ -170,7 +301,7 @@ public sealed class ArchiveClient(HttpClient http)
         Mirror mirror, Entry entry, string partPath, long resumeFrom,
         Action<long, long>? onProgress, CancellationToken ct)
     {
-        if (entry.Kind == Kind.Dat && (entry.ApproxSize < 0 || entry.ApproxSize >= SegmentedThresholdBytes))
+        if (UseSegments && entry.Kind == Kind.Dat && (entry.ApproxSize < 0 || entry.ApproxSize >= SegmentedThresholdBytes))
         {
             var segmented = await TryPullSegmentedAsync(mirror, entry, partPath, resumeFrom, onProgress, ct);
             if (segmented is not null) return segmented.Value;
@@ -184,11 +315,17 @@ public sealed class ArchiveClient(HttpClient http)
         {
             using var resp = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
 
-            // Server ignored the Range header, so start over from zero.
-            if (resumeFrom > 0 && resp.StatusCode != HttpStatusCode.PartialContent)
+            if (resumeFrom > 0)
             {
-                resumeFrom = 0;
-                if (File.Exists(partPath)) File.Delete(partPath);
+                bool honoured = resp.StatusCode == HttpStatusCode.PartialContent;
+                _honoursRange[(mirror.Id, entry.Kind)] = honoured;
+
+                // It sent the whole file instead of the tail, so the partial is now useless.
+                if (!honoured)
+                {
+                    resumeFrom = 0;
+                    if (File.Exists(partPath)) File.Delete(partPath);
+                }
             }
             resp.EnsureSuccessStatusCode();
 

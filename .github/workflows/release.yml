@@ -219,6 +219,15 @@ jobs:
           cp README.md dmgroot/
           ln -s /Applications dmgroot/Applications
 
+          # dotnet's arm64 publish already leaves an ad-hoc signature on the raw binary; wrapping
+          # it in a bundle without resealing the whole thing left Gatekeeper's assessment of
+          # Info.plist/Resources inconsistent with that inner signature. Confirmed hands-on: an
+          # unsealed bundle downloaded with a real quarantine flag shows Finder's *unrecoverable*
+          # "is damaged and can't be opened" dialog (no right-click override) rather than the
+          # normal "unidentified developer" one. Re-signing the whole bundle ad-hoc after assembly
+          # reseals it correctly and restores the normal (overridable) Gatekeeper prompt.
+          codesign --force --deep --sign - "$app"
+
           hdiutil create -volname "Steam2 Archive Browser" -srcfolder dmgroot -ov -format UDZO \
             steam2browser-osx-arm64.dmg
           ls -la steam2browser-osx-arm64.zip steam2browser-osx-arm64.dmg

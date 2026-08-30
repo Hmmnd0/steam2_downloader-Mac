@@ -223,6 +223,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # `gh release create` shells out to git to resolve repo context; without a checkout there's
+      # no .git directory and it fails with "not a git repository".
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           pattern: release-*

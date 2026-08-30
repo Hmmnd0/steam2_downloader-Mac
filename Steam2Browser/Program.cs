@@ -21,7 +21,10 @@ var handler = new SocketsHttpHandler
     ConnectTimeout = TimeSpan.FromSeconds(20),
 };
 var http = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
-http.DefaultRequestHeaders.UserAgent.ParseAdd("steam2browser/1.0");
+http.DefaultRequestHeaders.UserAgent.ParseAdd(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+    "AppleWebKit/537.36 (KHTML, like Gecko) " +
+    "Chrome/151.0.0.0 Safari/537.36");
 
 var client = new ArchiveClient(http)
 {
@@ -137,6 +140,7 @@ app.MapGet("/api/state", () => new
         settings.Failover,
         settings.Concurrency,
         settings.VerifyHashes,
+        settings.TorrentPort,
         settings.ExtractOutDir,
         trackers = settings.TrackersToUse,
     },
@@ -209,16 +213,24 @@ app.MapGet("/api/state", () => new
     },
 });
 
-app.MapPost("/api/settings", (SettingsPatch patch) =>
+app.MapPost("/api/settings", async (SettingsPatch patch) =>
 {
+    var resetTorrent = false;
     if (patch.MirrorId is { } mid) { settings.MirrorId = mid; client.Primary = Mirrors.ById(mid); }
     if (patch.Failover is { } fo) { settings.Failover = fo; client.Failover = fo; }
     if (patch.Concurrency is { } cc) settings.Concurrency = Math.Clamp(cc, 1, 64);
     if (patch.VerifyHashes is { } vh) settings.VerifyHashes = vh;
+    if (patch.TorrentPort is { } tp)
+    {
+        int port = tp is < 0 or > 65535 ? 0 : tp;
+        resetTorrent = port != settings.TorrentPort;
+        settings.TorrentPort = port;
+    }
     if (!string.IsNullOrWhiteSpace(patch.DataDir)) settings.DataDir = patch.DataDir!;
     if (!string.IsNullOrWhiteSpace(patch.ExtractOutDir)) settings.ExtractOutDir = patch.ExtractOutDir!;
     if (patch.ExtraTrackers is { } tr) settings.ExtraTrackers = tr;
     settings.Save();
+    if (resetTorrent) await torrent.ResetAsync();
     return Results.Ok(new { ok = true });
 });
 
@@ -533,7 +545,7 @@ return 0;
 
 internal sealed record SettingsPatch(
     string? MirrorId, bool? Failover, int? Concurrency, bool? VerifyHashes,
-    string? DataDir, string? ExtractOutDir, string[]? ExtraTrackers);
+    int? TorrentPort, string? DataDir, string? ExtractOutDir, string[]? ExtraTrackers);
 
 internal sealed record ReloadRequest(bool Refresh, bool Sizes);
 internal sealed record PlanRequest(int Depot, int Version, string? BlobCrc);

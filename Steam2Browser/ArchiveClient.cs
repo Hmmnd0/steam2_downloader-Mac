@@ -10,6 +10,10 @@ namespace Steam2Browser;
 /// </summary>
 public sealed class ArchiveClient(HttpClient http)
 {
+    private const long SegmentedThresholdBytes = 32L * 1024 * 1024;
+    private const int SegmentSizeBytes = 16 * 1024 * 1024;
+    private const int SegmentsPerFile = 4;
+
     public Mirror Primary { get; set; } = Mirrors.All[0];
 
     /// <summary>When true, a failed request is retried against the remaining mirrors.</summary>
@@ -128,6 +132,12 @@ public sealed class ArchiveClient(HttpClient http)
         Mirror mirror, Entry entry, string partPath, long resumeFrom,
         Action<long, long>? onProgress, CancellationToken ct)
     {
+        if (resumeFrom == 0 && entry.Kind == Kind.Dat && (entry.ApproxSize < 0 || entry.ApproxSize >= SegmentedThresholdBytes))
+        {
+            var segmented = await TryPullSegmentedAsync(mirror, entry, partPath, onProgress, ct);
+            if (segmented is not null) return segmented.Value;
+        }
+
         using var req = new HttpRequestMessage(HttpMethod.Get, mirror.Url(entry.RelPath));
         if (resumeFrom > 0) req.Headers.Range = new RangeHeaderValue(resumeFrom, null);
 
@@ -162,6 +172,109 @@ public sealed class ArchiveClient(HttpClient http)
         }
 
         return pulled;
+    }
+
+    private async Task<long?> TryPullSegmentedAsync(
+        Mirror mirror, Entry entry, string partPath,
+        Action<long, long>? onProgress, CancellationToken ct)
+    {
+        long length = await GetMirrorLengthAsync(mirror, entry.RelPath, ct);
+        if (length < SegmentedThresholdBytes) return null;
+
+        Directory.CreateDirectory(Path.GetDirectoryName(partPath)!);
+
+        try
+        {
+            await using (var fs = new FileStream(partPath, FileMode.Create, FileAccess.Write, FileShare.ReadWrite, 1, useAsync: true))
+                fs.SetLength(length);
+
+            var ranges = new Queue<(int Index, long From, long To)>();
+            int index = 0;
+            for (long from = 0; from < length; from += SegmentSizeBytes)
+                ranges.Enqueue((index++, from, Math.Min(length - 1, from + SegmentSizeBytes - 1)));
+
+            var segmentProgress = new long[index];
+            var progressLock = new object();
+            long done = 0;
+
+            var workers = Enumerable.Range(0, SegmentsPerFile).Select(async _ =>
+            {
+                while (true)
+                {
+                    (int Index, long From, long To) range;
+                    lock (ranges)
+                    {
+                        if (ranges.Count == 0) return;
+                        range = ranges.Dequeue();
+                    }
+
+                    await PullRangeAsync(mirror, entry, partPath, range.From, range.To, segmentDone =>
+                    {
+                        lock (progressLock)
+                        {
+                            long delta = segmentDone - segmentProgress[range.Index];
+                            if (delta <= 0) return;
+
+                            segmentProgress[range.Index] = segmentDone;
+                            done += delta;
+                            onProgress?.Invoke(done, length);
+                        }
+                    }, ct);
+                }
+            });
+
+            await Task.WhenAll(workers);
+            onProgress?.Invoke(length, length);
+            return length;
+        }
+        catch
+        {
+            try { if (File.Exists(partPath)) File.Delete(partPath); } catch { /* next mirror or caller handles the real error */ }
+            throw;
+        }
+    }
+
+    private async Task<long> GetMirrorLengthAsync(Mirror mirror, string relPath, CancellationToken ct)
+    {
+        using var req = new HttpRequestMessage(HttpMethod.Head, mirror.Url(relPath));
+        using var resp = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+        if (resp.StatusCode == HttpStatusCode.NotFound) return -1;
+        resp.EnsureSuccessStatusCode();
+        return resp.Content.Headers.ContentLength ?? -1;
+    }
+
+    private async Task PullRangeAsync(
+        Mirror mirror, Entry entry, string partPath, long from, long to,
+        Action<long> onSegmentProgress, CancellationToken ct)
+    {
+        using var req = new HttpRequestMessage(HttpMethod.Get, mirror.Url(entry.RelPath));
+        req.Headers.Range = new RangeHeaderValue(from, to);
+
+        using var resp = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+        if (resp.StatusCode != HttpStatusCode.PartialContent)
+            throw new HttpRequestException($"range request was not honored by {mirror.Id}");
+        resp.EnsureSuccessStatusCode();
+
+        await using var netStream = await resp.Content.ReadAsStreamAsync(ct);
+        await using var file = new FileStream(
+            partPath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite,
+            1 << 20, useAsync: true);
+        file.Seek(from, SeekOrigin.Begin);
+
+        var buffer = new byte[1 << 20];
+        long remaining = to - from + 1;
+        long done = 0;
+
+        while (remaining > 0)
+        {
+            int read = await netStream.ReadAsync(buffer.AsMemory(0, (int)Math.Min(buffer.Length, remaining)), ct);
+            if (read == 0) throw new EndOfStreamException($"range {from}-{to} ended early");
+
+            await file.WriteAsync(buffer.AsMemory(0, read), ct);
+            remaining -= read;
+            done += read;
+            onSegmentProgress(done);
+        }
     }
 
     public static async Task<bool> VerifyAsync(string path, string expectedSha, CancellationToken ct = default)

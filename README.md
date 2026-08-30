@@ -8,14 +8,23 @@ Single executable. It starts a local server and opens your browser.
 
 ## Run
 
-Download `steam2browser-win-x64.zip` from the
-[latest release](https://github.com/extremebleem/steam2_downloader/releases), unzip, run
-`steam2browser.exe`. Nothing else to install.
+Download `steam2browser-osx-arm64.zip` (Apple Silicon) from the
+[latest release](https://github.com/Hmmnd0/steam2_downloader-Mac/releases), unzip, run
+`steam2browser`. Nothing else to install.
+
+The binary is unsigned, so macOS Gatekeeper will refuse to open it the first time. Clear the
+quarantine flag once, from Terminal:
 
 ```
-steam2browser.exe                 # opens http://127.0.0.1:5099
-steam2browser.exe --port=6000     # different port
-steam2browser.exe --no-browser    # do not launch a browser
+xattr -d com.apple.quarantine steam2browser
+```
+
+Then:
+
+```
+./steam2browser                   # opens http://127.0.0.1:5099
+./steam2browser --port=6000       # different port
+./steam2browser --no-browser      # do not launch a browser
 ```
 
 Everything it writes lives in `steam2info/` next to the executable — the name cache, downloads
@@ -73,14 +82,7 @@ cd Steam2Browser
 dotnet run
 ```
 
-Release build (Windows):
-
-```
-dotnet publish Steam2Browser/Steam2Browser.csproj -c Release -r win-x64 --self-contained true \
-  -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true -o out
-```
-
-Release build (macOS, Apple Silicon):
+Release build (Apple Silicon):
 
 ```
 dotnet publish Steam2Browser/Steam2Browser.csproj -c Release -r osx-arm64 --self-contained true \
@@ -90,8 +92,8 @@ dotnet publish Steam2Browser/Steam2Browser.csproj -c Release -r osx-arm64 --self
 For an Intel Mac, use `-r osx-x64` instead. The `-r` flag overrides the `win-x64` default baked
 into the `.csproj`. CI builds and releases both `win-x64` and `osx-arm64` on every push to `main`.
 
-Leave `EnableCompressionInSingleFile` off on macOS: with it on, the published binary hit an
-intermittent `AccessViolationException` under concurrent requests on .NET 10.0.400 osx-arm64.
+Leave `EnableCompressionInSingleFile` off: with it on, the published binary hit an intermittent
+`AccessViolationException` under concurrent requests on .NET 10.0.400 osx-arm64.
 
 ## Credits
 

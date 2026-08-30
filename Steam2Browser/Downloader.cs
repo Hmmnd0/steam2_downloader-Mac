@@ -49,7 +49,7 @@ public sealed class DownloadJob
     }
 }
 
-public sealed class DownloadManager(ArchiveClient client, Settings settings)
+public sealed class DownloadManager(ArchiveClient client, Settings settings, TorrentSource torrent)
 {
     private readonly ConcurrentDictionary<string, DownloadJob> _jobs = new();
     private int _seq;
@@ -105,6 +105,19 @@ public sealed class DownloadManager(ArchiveClient client, Settings settings)
             .ThenBy(f => f.Entry.Version)
             .ToList();
 
+        // The swarm is a whole-selection transfer rather than a queue of individual GETs, so it
+        // takes its own path. Anything the torrent does not carry falls back to HTTP below.
+        if (client.Primary.IsTorrent)
+        {
+            ordered = await ViaTorrentAsync(job, ordered, ct);
+            if (ordered.Count == 0)
+            {
+                Finish(job);
+                return;
+            }
+            job.Say($"{ordered.Count} file(s) are not in the torrent — fetching those over HTTP");
+        }
+
         var tasks = ordered.Select(async pf =>
         {
             await gate.WaitAsync(ct);
@@ -121,11 +134,7 @@ public sealed class DownloadManager(ArchiveClient client, Settings settings)
         try
         {
             await Task.WhenAll(tasks);
-            job.Status = job.FailedFiles > 0 ? "failed" : "done";
-            if (job.FailedFiles > 0) job.Error = $"{job.FailedFiles} file(s) failed";
-            job.Say(job.FailedFiles > 0
-                ? $"finished with {job.FailedFiles} failure(s)"
-                : $"finished — {job.DoneFiles} downloaded, {job.SkippedFiles} already present");
+            Finish(job);
         }
         catch (OperationCanceledException)
         {
@@ -144,6 +153,41 @@ public sealed class DownloadManager(ArchiveClient client, Settings settings)
             job.SpeedBps = 0;
             job.Active.Clear();
         }
+    }
+
+    private static void Finish(DownloadJob job)
+    {
+        job.Status = job.FailedFiles > 0 ? "failed" : "done";
+        if (job.FailedFiles > 0) job.Error = $"{job.FailedFiles} file(s) failed";
+        job.Say(job.FailedFiles > 0
+            ? $"finished with {job.FailedFiles} failure(s)"
+            : $"finished — {job.DoneFiles} downloaded, {job.SkippedFiles} already present");
+    }
+
+    /// <summary>
+    /// Pulls what the swarm has. Returns the files it could not supply, for the HTTP path to pick up.
+    /// </summary>
+    private async Task<List<PlanFile>> ViaTorrentAsync(DownloadJob job, List<PlanFile> files, CancellationToken ct)
+    {
+        // Files already on disk need neither source.
+        var needed = files
+            .Where(f => !File.Exists(Path.Combine(settings.DataDir, f.Entry.DirName, f.Entry.FileName)))
+            .ToList();
+
+        job.SkippedFiles += files.Count - needed.Count;
+        if (needed.Count == 0) return [];
+
+        job.Say("waiting for the torrent file list");
+
+        var missing = await torrent.DownloadAsync(
+            needed.Select(f => f.Entry).ToList(),
+            (done, _, _) => Interlocked.Exchange(ref job.DoneBytes, done),
+            ct);
+
+        var missingNames = missing.Select(e => e.FileName).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        job.DoneFiles += needed.Count - missingNames.Count;
+
+        return needed.Where(f => missingNames.Contains(f.Entry.FileName)).ToList();
     }
 
     /// <summary>Samples DoneBytes once a second so the UI has a throughput figure to show.</summary>

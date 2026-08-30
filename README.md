@@ -99,3 +99,9 @@ Leave `EnableCompressionInSingleFile` off: with it on, the published binary hit 
 
 The archive, the original C++ extractor and the depot key table come from the terarelease dump.
 Please mirror and seed it.
+
+The depot names come from [dr3murr/steam2-winfsp](https://github.com/dr3murr/steam2-winfsp), whose
+[`data/depot_labels.tsv`](https://github.com/dr3murr/steam2-winfsp/blob/main/data/depot_labels.tsv)
+puts a real product name on 9 877 of the 10 876 depots here. That is painstaking work and it is what
+makes the archive searchable — a manifest only ever yields folder names like `cstrike` or
+`platform`. Depots it marks `Unknown / No Depot` fall through to this app's own naming passes.

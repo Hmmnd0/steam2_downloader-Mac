@@ -16,6 +16,7 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.FileProviders.Embedded" Version="10.0.0" />
+    <PackageReference Include="MonoTorrent" Version="3.0.2" />
   </ItemGroup>
 
   <ItemGroup>
@@ -27,9 +28,7 @@
       app starts with no network at all; without it, it falls back to fetching the index from a
       mirror. Not committed, so a plain clone still builds.
     -->
-    <EmbeddedResource Include="index.bin"
-                      Condition="Exists('index.bin')"
-                      LogicalName="Steam2Browser.index.bin" />
+    <EmbeddedResource Include="index.bin" Condition="Exists('index.bin')" LogicalName="Steam2Browser.index.bin" />
   </ItemGroup>
 
   <!--

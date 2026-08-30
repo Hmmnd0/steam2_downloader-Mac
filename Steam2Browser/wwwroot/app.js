@@ -70,8 +70,15 @@ async function refreshState() {
       ['size', c.sizesLoaded ? '~' + bytes(c.totalBytes) : '…', 'archive size', false],
       ['resets', num(c.resetDepots), 'with resets', false],
       ['incomplete', num(c.incompleteDepots), 'incomplete', false],
-      ['named', `${num(s.names.named)} / ${num(c.depots)}`, s.names.running ? 'naming…' : 'named', s.names.running],
-      ['steam', `${num(s.steam.found)} / ${num(s.steam.checked)}`, s.steam.running ? 'asking steam…' : 'from steam', s.steam.running],
+      // Named counts every source, so it is a share of the whole archive. While a pass is
+      // running the label says how much is left rather than restating the same fraction.
+      ['named', `${num(s.names.named)} / ${num(c.depots)}`,
+        s.names.running ? `naming — ${num(s.names.remaining)} left` : 'named', s.names.running],
+      // Value is what Steam actually recognised. "checked" accumulates across runs while
+      // "remaining" is this run's queue, so adding them made a denominator that meant nothing.
+      ['steam', num(s.steam.found),
+        s.steam.running ? `asking steam — ${num(s.steam.remaining)} left` : 'named by steam',
+        s.steam.running],
     ]);
 
     maybeRefreshNames(s.names.named);
@@ -121,7 +128,7 @@ function renderUpdate(u) {
     chip.className = 'chip ' + u.state;
     chip.textContent = (u.state === 'available' ? '↑ ' : '! ') + UPDATE_LABEL[u.state];
     chip.title = u.message || '';
-    chip.href = u.commitUrl || u.repoUrl || '#';
+    chip.href = 'https://github.com/extremebleem/steam2_downloader/releases';
   }
 
   const text = $('#updText');

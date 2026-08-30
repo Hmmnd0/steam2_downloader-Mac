@@ -1,5 +1,6 @@
 using MonoTorrent;
 using MonoTorrent.Client;
+using System.Net;
 
 namespace Steam2Browser;
 
@@ -104,6 +105,17 @@ public sealed class TorrentSource(Settings settings)
                     AutoSaveLoadDhtCache = true,
                     MaximumConnections = 200,
                 };
+
+                if (settings.TorrentPort > 0)
+                {
+                    builder.ListenEndPoints = new()
+                    {
+                        ["ipv4"] = new IPEndPoint(IPAddress.Any, settings.TorrentPort),
+                        ["ipv6"] = new IPEndPoint(IPAddress.IPv6Any, settings.TorrentPort),
+                    };
+                    builder.DhtEndPoint = new IPEndPoint(IPAddress.Any, settings.TorrentPort);
+                }
+
                 _engine = new ClientEngine(builder.ToSettings());
             }
 
@@ -385,6 +397,41 @@ public sealed class TorrentSource(Settings settings)
         catch (Exception ex)
         {
             Status.Error = ex.Message;
+        }
+    }
+
+    public async Task ResetAsync()
+    {
+        await _gate.WaitAsync();
+        try
+        {
+            if (_manager is not null)
+                await _manager.StopAsync(TimeSpan.FromSeconds(5));
+
+            _engine?.Dispose();
+            _engine = null;
+            _manager = null;
+            _byArchivePath.Clear();
+
+            Status.State = "off";
+            Status.Message = settings.TorrentPort > 0
+                ? $"torrent engine reset; next start will listen on port {settings.TorrentPort}"
+                : "torrent engine reset; next start will choose a random port";
+            Status.Error = null;
+            Status.HasMetadata = false;
+            Status.TotalFiles = 0;
+            Status.SelectedFiles = 0;
+            Status.SelectedBytes = 0;
+            Status.SelectedProgress = 0;
+            Status.Peers = 0;
+            Status.Seeds = 0;
+            Status.DownloadRate = 0;
+            Status.UploadRate = 0;
+            Status.TorrentState = "";
+        }
+        finally
+        {
+            _gate.Release();
         }
     }
 }

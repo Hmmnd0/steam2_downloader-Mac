@@ -15,10 +15,9 @@ Download from the [latest release](https://github.com/Hmmnd0/steam2_downloader-M
   Opens `http://127.0.0.1:5099` in your browser; no Terminal needed.
 - **`.zip`** — a raw binary, for running from Terminal with flags (see below).
 
-A signed and notarized release opens with no warning at all. If a particular build isn't (CI's
-automated builds are ad-hoc-signed, not notarized), Gatekeeper blocks the first launch: right-click
-the app → **Open** → **Open** again in the dialog. For the raw binary from the zip, clear the
-quarantine flag once instead:
+Signed and notarized — opens with no warning. If you ever see a Gatekeeper block anyway,
+right-click the app → **Open** → **Open** again in the dialog. For the raw binary from the zip,
+clear the quarantine flag once instead:
 
 ```
 xattr -d com.apple.quarantine steam2browser
@@ -80,28 +79,6 @@ before it ever looks at the filemodes.
 
 **223 `(depot, version)` pairs have a blob but no dat**, and 62 depots have gaps in their chain.
 Those are flagged as `incomplete`, because extraction will fail partway through.
-
-## Build
-
-Needs the .NET 10 SDK.
-
-```
-cd Steam2Browser
-dotnet run
-```
-
-Release build (Apple Silicon):
-
-```
-dotnet publish Steam2Browser/Steam2Browser.csproj -c Release -r osx-arm64 --self-contained true \
-  -p:PublishSingleFile=true -o out
-```
-
-For an Intel Mac, use `-r osx-x64` instead. The `-r` flag overrides the `win-x64` default baked
-into the `.csproj`. CI builds and releases both `win-x64` and `osx-arm64` on every push to `main`.
-
-Leave `EnableCompressionInSingleFile` off: with it on, the published binary hit an intermittent
-`AccessViolationException` under concurrent requests on .NET 10.0.400 osx-arm64.
 
 ## Credits
 

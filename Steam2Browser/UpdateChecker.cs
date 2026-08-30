@@ -15,25 +15,20 @@ public sealed class UpdateStatus
     public string RepoUrl = "";
 
     public DateTime? BuiltUtc;
-    public DateTime? LatestCommitUtc;
-    public string? CommitSha;
-    public string? CommitShort;
-    public string? CommitMessage;
-    public string? CommitAuthor;
-    public string? CommitUrl;
+    public string? ReleaseTag;
+    public DateTime? ReleasePublishedUtc;
+    public string? ReleaseUrl;
 
     public DateTime? CheckedUtc;
 }
 
 /// <summary>
-/// Answers "is there a newer build than mine" against the upstream GitHub repo.
+/// Answers "is there a newer build than mine" against this fork's own GitHub releases.
 ///
-/// That repo carries no tags and no releases, so there is no version number to compare. The
-/// comparison is by time instead: the newest commit on the default branch versus the moment this
-/// binary was built, which the build stamps into assembly metadata.
-///
-/// An empty repository is a normal state here, not a failure — GitHub answers the commits endpoint
-/// with 409 "Git Repository is empty" until the first push, and that is reported as such.
+/// Unlike upstream (no tags, no releases — compared by commit time instead), this fork publishes
+/// a tagged release on every push to main, so the releases endpoint is the right thing to compare
+/// against: the release's publish time versus the moment this binary was built, which the build
+/// stamps into assembly metadata.
 /// </summary>
 public sealed class UpdateChecker(HttpClient http)
 {
@@ -43,7 +38,7 @@ public sealed class UpdateChecker(HttpClient http)
 
     public void Initialise()
     {
-        Status.Repo = Meta("UpdateRepo") ?? "extremebleem/steam2_downloader";
+        Status.Repo = Meta("UpdateRepo") ?? "Hmmnd0/steam2_downloader-Mac";
         Status.RepoUrl = $"https://github.com/{Status.Repo}";
         Status.BuiltUtc = BuildTime();
         Status.Message = "not checked yet";
@@ -93,26 +88,19 @@ public sealed class UpdateChecker(HttpClient http)
 
             using var req = new HttpRequestMessage(
                 HttpMethod.Get,
-                $"https://api.github.com/repos/{Status.Repo}/commits?per_page=1");
+                $"https://api.github.com/repos/{Status.Repo}/releases/latest");
             req.Headers.Accept.ParseAdd("application/vnd.github+json");
             req.Headers.Add("X-GitHub-Api-Version", "2022-11-28");
 
             using var resp = await http.SendAsync(req, ct);
 
-            // The repository exists but nothing has been pushed to it yet.
-            if (resp.StatusCode == HttpStatusCode.Conflict)
-            {
-                Status.State = "empty";
-                Status.Message = "nothing published upstream yet — the repository has no commits";
-                Status.LatestCommitUtc = null;
-                Status.CommitSha = null;
-                return;
-            }
-
+            // No release published yet is a normal state here, not a failure.
             if (resp.StatusCode == HttpStatusCode.NotFound)
             {
-                Status.State = "error";
-                Status.Message = $"repository {Status.Repo} not found (or private)";
+                Status.State = "empty";
+                Status.Message = "no release published yet";
+                Status.ReleaseTag = null;
+                Status.ReleasePublishedUtc = null;
                 return;
             }
 
@@ -130,56 +118,30 @@ public sealed class UpdateChecker(HttpClient http)
 
             await using var body = await resp.Content.ReadAsStreamAsync(ct);
             using var doc = await JsonDocument.ParseAsync(body, cancellationToken: ct);
+            var release = doc.RootElement;
 
-            if (doc.RootElement.ValueKind != JsonValueKind.Array || doc.RootElement.GetArrayLength() == 0)
-            {
-                Status.State = "empty";
-                Status.Message = "nothing published upstream yet — no commits on the default branch";
-                return;
-            }
+            Status.ReleaseTag = release.TryGetProperty("tag_name", out var tag) ? tag.GetString() : null;
+            Status.ReleaseUrl = release.TryGetProperty("html_url", out var url) ? url.GetString() : Status.RepoUrl;
 
-            var head = doc.RootElement[0];
-            var commit = head.GetProperty("commit");
-
-            Status.CommitSha = head.TryGetProperty("sha", out var sha) ? sha.GetString() : null;
-            Status.CommitShort = Status.CommitSha?[..Math.Min(7, Status.CommitSha.Length)];
-            Status.CommitUrl = head.TryGetProperty("html_url", out var url) ? url.GetString() : Status.RepoUrl;
-
-            Status.CommitMessage = commit.TryGetProperty("message", out var msg)
-                ? FirstLine(msg.GetString())
+            DateTime? when = release.TryGetProperty("published_at", out var pub) &&
+                              DateTime.TryParse(pub.GetString(), CultureInfo.InvariantCulture,
+                                  DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal, out var parsed)
+                ? parsed
                 : null;
 
-            Status.CommitAuthor = commit.TryGetProperty("author", out var author) &&
-                                  author.TryGetProperty("name", out var name)
-                ? name.GetString()
-                : null;
-
-            // Prefer the committer date: that is when the commit landed on the branch.
-            DateTime? when = null;
-            if (commit.TryGetProperty("committer", out var committer) &&
-                committer.TryGetProperty("date", out var cdate) &&
-                DateTime.TryParse(cdate.GetString(), CultureInfo.InvariantCulture,
-                    DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal, out var parsedC))
-                when = parsedC;
-            else if (commit.TryGetProperty("author", out var a2) &&
-                     a2.TryGetProperty("date", out var adate) &&
-                     DateTime.TryParse(adate.GetString(), CultureInfo.InvariantCulture,
-                         DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal, out var parsedA))
-                when = parsedA;
-
-            Status.LatestCommitUtc = when;
+            Status.ReleasePublishedUtc = when;
 
             if (when is null)
             {
                 Status.State = "error";
-                Status.Message = "the newest commit carries no usable date";
+                Status.Message = "the latest release carries no usable publish date";
                 return;
             }
 
             if (Status.BuiltUtc is not DateTime built)
             {
                 Status.State = "available";
-                Status.Message = $"upstream commit {Status.CommitShort} from {Ago(when.Value)}; " +
+                Status.Message = $"release {Status.ReleaseTag} published {Ago(when.Value)}; " +
                                  "this build carries no timestamp to compare against";
                 return;
             }
@@ -187,13 +149,13 @@ public sealed class UpdateChecker(HttpClient http)
             if (when.Value > built)
             {
                 Status.State = "available";
-                Status.Message = $"update available — commit {Status.CommitShort} is {Ago(when.Value)}, " +
+                Status.Message = $"update available — release {Status.ReleaseTag} is {Ago(when.Value)}, " +
                                  $"newer than this build from {Ago(built)}";
             }
             else
             {
                 Status.State = "current";
-                Status.Message = $"up to date — newest commit {Status.CommitShort} predates this build";
+                Status.Message = $"up to date — latest release {Status.ReleaseTag} predates this build";
             }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -211,14 +173,6 @@ public sealed class UpdateChecker(HttpClient http)
             Status.CheckedUtc = DateTime.UtcNow;
             _gate.Release();
         }
-    }
-
-    private static string FirstLine(string? s)
-    {
-        if (string.IsNullOrEmpty(s)) return "";
-        int nl = s.IndexOf('\n');
-        var line = nl >= 0 ? s[..nl] : s;
-        return line.Length > 160 ? line[..160] + "…" : line.Trim();
     }
 
     private static string Ago(DateTime utc)

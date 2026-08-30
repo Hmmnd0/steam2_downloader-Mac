@@ -128,7 +128,7 @@ function renderUpdate(u) {
     chip.className = 'chip ' + u.state;
     chip.textContent = (u.state === 'available' ? '↑ ' : '! ') + UPDATE_LABEL[u.state];
     chip.title = u.message || '';
-    chip.href = 'https://github.com/extremebleem/steam2_downloader/releases';
+    chip.href = u.releaseUrl || (u.repoUrl ? u.repoUrl + '/releases' : '#');
   }
 
   const text = $('#updText');
@@ -138,8 +138,8 @@ function renderUpdate(u) {
   if (built) {
     const parts = [];
     if (u.builtUtc) parts.push('this build: ' + new Date(u.builtUtc).toLocaleString());
-    if (u.latestCommitUtc) parts.push('newest commit: ' + new Date(u.latestCommitUtc).toLocaleString());
-    if (u.commitShort) parts.push(u.commitShort + (u.commitMessage ? ` — ${u.commitMessage}` : ''));
+    if (u.releasePublishedUtc) parts.push('latest release: ' + new Date(u.releasePublishedUtc).toLocaleString());
+    if (u.releaseTag) parts.push(u.releaseTag);
     built.textContent = parts.join('  ·  ');
   }
 }

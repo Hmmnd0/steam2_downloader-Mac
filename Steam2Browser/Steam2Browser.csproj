@@ -32,12 +32,12 @@
   </ItemGroup>
 
   <!--
-    The upstream repo has no tags or releases, so "is there a newer version" is answered by
-    comparing the newest commit time on GitHub against when this binary was built.
+    Points the in-app update checker at this fork's own releases, not upstream's — upstream ships
+    Windows only, and this fork exists specifically for macOS.
   -->
   <ItemGroup>
     <AssemblyMetadata Include="BuildTimeUtc" Value="$([System.DateTime]::UtcNow.ToString('O'))" />
-    <AssemblyMetadata Include="UpdateRepo" Value="extremebleem/steam2_downloader" />
+    <AssemblyMetadata Include="UpdateRepo" Value="Hmmnd0/steam2_downloader-Mac" />
   </ItemGroup>
 
 </Project>

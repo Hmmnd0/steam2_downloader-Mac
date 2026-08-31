@@ -128,6 +128,39 @@ jobs:
                 $problems += "$asset did not load"
               }
             }
+
+            # Serving the page only proves the web host came up. These are the parts that can fail
+            # on their own after that: an embedded catalog that does not load leaves an app with no
+            # depots in it, and a torrent engine that throws on startup used to show up only as a
+            # red status chip on someone's machine.
+            try {
+              $state = $null
+              foreach ($i in 1..30) {
+                $s = Invoke-RestMethod -Uri http://127.0.0.1:5099/api/state -TimeoutSec 5
+                if ($s.status.ready) { $state = $s; break }
+                Start-Sleep -Seconds 2
+              }
+              if (-not $state) {
+                $problems += 'the index never finished loading'
+              } elseif ($state.catalog.depots -lt 10000) {
+                $problems += "the catalog holds only $($state.catalog.depots) depots"
+              } else {
+                Write-Host "index ready with $($state.catalog.depots) depots"
+              }
+              if ($state -and -not $state.disk.root) {
+                $problems += 'free space could not be read for the download directory'
+              }
+            } catch {
+              $problems += "/api/state did not answer: $_"
+            }
+
+            try {
+              $seed = Invoke-RestMethod -Uri http://127.0.0.1:5099/api/seed -TimeoutSec 10
+              if ($seed.state -eq 'error') { $problems += "sharing failed to start: $($seed.message)" }
+              else { Write-Host "sharing reports '$($seed.state)'" }
+            } catch {
+              $problems += "/api/seed did not answer: $_"
+            }
           }
 
           Stop-Process -Id $exe.Id -Force -ErrorAction SilentlyContinue

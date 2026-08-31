@@ -5,7 +5,6 @@
 [![Stars](https://img.shields.io/github/stars/extremebleem/steam2_downloader?label=stars&color=4c8b2b)](https://github.com/extremebleem/steam2_downloader/stargazers)
 [![Build status](https://github.com/extremebleem/steam2_downloader/actions/workflows/release.yml/badge.svg)](https://github.com/extremebleem/steam2_downloader/actions/workflows/release.yml)
 ![Windows and Linux, x64](https://img.shields.io/badge/platform-windows%20%7C%20linux-555)
-[![Written by Claude Code](https://img.shields.io/badge/written%20by-Claude%20Code-d97757)](https://claude.com/claude-code)
 ![11,078 lines by Claude Code](https://img.shields.io/badge/lines%20by%20Claude%20Code-11%2C078-d97757)
 ![62 lines from pull requests](https://img.shields.io/badge/lines%20from%20PRs-62-4c8b2b)
 ![0 lines by the maintainer](https://img.shields.io/badge/lines%20by%20the%20maintainer-0-555)

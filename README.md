@@ -5,8 +5,8 @@
 [![Stars](https://img.shields.io/github/stars/extremebleem/steam2_downloader?label=stars&color=4c8b2b)](https://github.com/extremebleem/steam2_downloader/stargazers)
 [![Build status](https://github.com/extremebleem/steam2_downloader/actions/workflows/release.yml/badge.svg)](https://github.com/extremebleem/steam2_downloader/actions/workflows/release.yml)
 ![Windows and Linux, x64](https://img.shields.io/badge/platform-windows%20%7C%20linux-555)
-![11,078 lines by Claude Code](https://img.shields.io/badge/lines%20by%20Claude%20Code-11%2C078-d97757)
-![62 lines from pull requests](https://img.shields.io/badge/lines%20from%20PRs-62-4c8b2b)
+![11,263 lines by Claude Code](https://img.shields.io/badge/lines%20by%20Claude%20Code-11%2C263-d97757)
+![287 lines from pull requests](https://img.shields.io/badge/lines%20from%20PRs-287-4c8b2b)
 ![0 lines by the maintainer](https://img.shields.io/badge/lines%20by%20the%20maintainer-0-555)
 
 A desktop browser and downloader for the [terarelease](https://de.steam2.download/) Steam2 content
@@ -24,11 +24,11 @@ your browser.
 ![Steam2 Downloader browsing depot 841 (Portal 2): the depot list, the delta chain planner with its download size estimate, and the version history expanded on v37 to show the four changed files.](assets/img1.png)
 
 Every line here was written by [Claude Code](https://claude.com/claude-code) or arrived in a pull
-request. The maintainer wrote none of it by hand: 11 078 of the 11 140 source lines came out of
+request. The maintainer wrote none of it by hand: 11 263 of the 11 550 source lines came out of
 Claude Code sessions — the archive format work, the extractor, the chain planner and the interface —
-and the other 62 are the Linux support contributed by [SkyKingPX](https://github.com/SkyKingPX).
-Counted over `.cs`, `.js`, `.css`, `.html`, `.yml` and `.md`, excluding the depot key table, the
-catalog snapshot and other data files.
+and the other 287 came from contributors, listed under [Credits](#credits). Counted over `.cs`,
+`.js`, `.css`, `.html`, `.yml` and `.md`, excluding the depot key table, the catalog snapshot and
+other data files.
 
 ## Install and run
 
@@ -79,6 +79,18 @@ follows the parent CRC links recorded inside each blob and picks the right `.dat
 the blob records, instead of downloading both branches. Reset depots are split into branches so a
 fork does not read as one jumbled history.
 
+### Skip the dats a version never reads
+
+A chain is not the same thing as the bytes a version needs. Every file in a depot records which
+version's `.dat` holds its payload, and a later version that rewrites a file takes that payload
+over completely — so a `.dat` whose every file was overwritten again before your target version
+contributes nothing to it and does not need downloading.
+
+The planner works this out from the blobs, which are small, and drops those dats before the
+download starts. On depot 241 at v56 that is 55 of 57 dats. The figure is shown before you commit
+to anything, and a checkbox next to the version selector turns the whole thing off for archiving
+the depot in full.
+
 ### Version history and diffs
 
 Per version: which files were added, changed and removed, with the size delta for each, expandable
@@ -105,6 +117,31 @@ of the archive without paying for any dat.
 A browser-side mode saves a chain into a folder you pick, laid out as `blobs/` and `dats/` so the
 extractor finds it, skipping files already the right size.
 
+Free space on the download drive is checked before a download starts, and shown as a bar in
+Settings. A chain that does not fit leaves the download button disabled with the reason on hover,
+and the same check runs again inside the download itself, so a pack whose disk fills up on its
+fourth depot stops with a clear message rather than a write error.
+
+### Share what you have
+
+The archive is 13 TB kept alive by a handful of seeders, and its three HTTP mirrors are paid for by
+one person who has asked people to pull less from them. So sharing is on by default: everything
+already downloaded is offered back to the swarm, and files finishing now join it without a restart.
+Uploads only — nothing extra is ever fetched in order to share it.
+
+Files are hard-linked into the engine's own directory rather than copied, so sharing a downloaded
+depot costs no additional disk space, and that directory sits inside the download directory so the
+links can never be asked to cross a volume.
+
+The swarm also helps with downloading: the mirror takes the file list from the front, the swarm
+takes it from the back, and they meet in the middle. Whichever source is faster ends up carrying
+more, and the swarm never holds a download up — anything it has not finished, the mirror fetches.
+Every file it does supply is one the mirrors were not asked for.
+
+Upload and download speed caps are in Settings, unlimited by default, and apply without a restart.
+Sharing and the swarm can each be switched off on their own, and the whole engine with them; the
+HTTP mirrors keep working either way.
+
 ### Extract
 
 Built in. The blob container, manifest, file id tables, AES-128-CFB and zlib chunk handling are all
@@ -125,6 +162,27 @@ in one click, each as its own download with its own chain.
 Contributions go through a pull request, and a check validates them against the real archive —
 a build naming a depot or version that does not exist fails before it can be merged.
 [`apps/README.md`](apps/README.md) has the format.
+
+## Other tools for the same archive
+
+This one downloads and extracts. If that is not what you are after, these are worth knowing about,
+and two of them answer questions this app deliberately does not.
+
+**[steambrowser.net](https://www.steambrowser.net)** — a web index of every file in the leak. It
+opens the VPKs and reads what is inside them, so you can look through the contents of a depot in a
+browser without downloading anything at all.
+
+**[steam2-db.pages.dev](https://steam2-db.pages.dev/)** — a second web index of the same kind, and
+a useful cross-check when one of them is missing something.
+
+**[valves-2pacalypse](https://archive.org/details/valves-2pacalypse)** on archive.org — an archive
+of everything notable to come out of the Steam2 depot leaks, beyond the depots themselves.
+
+**[dr3murr/steam2-winfsp](https://github.com/dr3murr/steam2-winfsp)** — mounts `.blob` and `.dat`
+archives as an ordinary filesystem through WinFsp on Windows or FUSE3 on Linux, decoding chunks on
+demand. Nothing is extracted: it resolves depot ancestry, pairs the DATs, composes the overlay and
+launches the build straight from the mounted tree. Run a game without unpacking it first. Its depot
+label table is also where this app gets most of its product names — see [Credits](#credits).
 
 ## Things worth knowing about the archive
 
@@ -175,6 +233,14 @@ Please mirror and seed it.
 
 Linux support was contributed by [SkyKingPX](https://github.com/SkyKingPX) in
 [#6](https://github.com/extremebleem/steam2_downloader/pull/6).
+
+The piece picker that made sharing practical was contributed by
+[Chopper1337](https://github.com/Chopper1337) in
+[#8](https://github.com/extremebleem/steam2_downloader/pull/8). Selecting files one at a time
+through MonoTorrent's own API costs about 4 ms each, which over 116 346 files is eight and a half
+minutes before sharing can begin; the picker holds the selection itself instead. Bundling the
+torrent into the release came from the same contributor in
+[#7](https://github.com/extremebleem/steam2_downloader/pull/7).
 
 Depot names come from [dr3murr/steam2-winfsp](https://github.com/dr3murr/steam2-winfsp), whose
 [`data/depot_labels.tsv`](https://github.com/dr3murr/steam2-winfsp/blob/main/data/depot_labels.tsv)

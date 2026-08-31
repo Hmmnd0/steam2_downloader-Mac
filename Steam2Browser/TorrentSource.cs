@@ -100,6 +100,36 @@ public sealed class TorrentSource(Settings settings)
     private volatile bool _seedRefreshPending;
 
     /// <summary>
+    /// Whether sharing is still wanted by the time each stage of starting it finishes.
+    ///
+    /// Starting takes a while — reading the file list, linking, then hashing what was linked — and
+    /// the switch can be thrown at any point during it, which is exactly what happens when someone
+    /// is shown the notice on first run and says no. Stopping could not reach a start that had not
+    /// finished, because the manager it looks for is only published at the very end, so the start
+    /// ran to completion and announced itself as sharing over the top of the refusal. Sharing after
+    /// being told not to is not a glitch to tidy up later, so every stage checks this before going
+    /// on and the last one checks it before committing.
+    /// </summary>
+    private volatile bool _seedWanted;
+
+    /// <summary>
+    /// Sharing was asked for and has not since been called off.
+    /// </summary>
+    private bool SeedStillWanted => _seedWanted && settings.TorrentEnabled && settings.SeedDownloaded;
+
+    /// <summary>Leaves the display saying what is true: sharing was asked for and then was not.</summary>
+    private void CallOff()
+    {
+        _seedManager = null;
+        Status.SeedState = "off";
+        Status.SeedMessage = "";
+        Status.SeedFiles = 0;
+        Status.SeedBytes = 0;
+        Status.SeedUploadRate = 0;
+        Status.SeedPeers = 0;
+    }
+
+    /// <summary>
     /// Whether a download currently owns the manager.
     ///
     /// Downloading and sharing are the same manager and the same picker, and sharing's half of that
@@ -179,6 +209,7 @@ public sealed class TorrentSource(Settings settings)
         {
             Status.SeedState = "starting";
             Status.SeedMessage = "reading the file list";
+            _seedWanted = true;
 
             if (!await EnsureStartedAsync(ct) || _manager is null)
             {
@@ -187,8 +218,12 @@ public sealed class TorrentSource(Settings settings)
                 return;
             }
 
+            if (!SeedStillWanted) { CallOff(); return; }
+
             Status.SeedMessage = "linking what is already downloaded";
             var (linked, bytes) = LinkArchiveIntoTorrentData();
+
+            if (!SeedStillWanted) { CallOff(); return; }
 
             Status.SeedFiles = linked;
             Status.SeedBytes = bytes;
@@ -217,6 +252,15 @@ public sealed class TorrentSource(Settings settings)
                 await _manager.StopAsync(TimeSpan.FromSeconds(10));
 
             await _manager.HashCheckAsync(autoStart: true);
+
+            // The hash check cannot be interrupted part way, so a refusal that arrived during it is
+            // honoured here instead: the manager is put back down and nothing is ever offered.
+            if (!SeedStillWanted)
+            {
+                try { await _manager.StopAsync(TimeSpan.FromSeconds(10)); } catch { }
+                CallOff();
+                return;
+            }
 
             _seedManager = _manager;
             Status.SeedState = "sharing";
@@ -430,6 +474,13 @@ public sealed class TorrentSource(Settings settings)
 
     public async Task StopSeedingAsync()
     {
+        // Said first, so that a start still working its way through the stages sees it and gives
+        // up. Without it the refusal reached only a start that had already finished — the manager
+        // below is not published until the last line of one — and a start still running carried on
+        // to the end and announced itself as sharing over the top of the refusal.
+        _seedWanted = false;
+        _seedRefreshPending = false;
+
         // Status is cleared first and unconditionally. There may be no manager yet — sharing spends
         // its first stretch inside EnsureStartedAsync — and returning early there used to leave the
         // display insisting it was still starting long after it had been switched off.

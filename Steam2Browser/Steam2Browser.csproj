@@ -31,6 +31,11 @@
     <EmbeddedResource Include="index.bin" Condition="Exists('index.bin')" LogicalName="Steam2Browser.index.bin" />
   </ItemGroup>
 
+  <ItemGroup>
+    <None Include="../steam2.torrent" Link="steam2.torrent"
+          CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
   <!--
     The upstream repo has no tags or releases, so "is there a newer version" is answered by
     comparing the newest commit time on GitHub against when this binary was built.

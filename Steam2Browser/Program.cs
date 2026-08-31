@@ -561,14 +561,24 @@ app.MapGet("/api/depots/{id:int}", (int id) =>
     string blobDir = Path.Combine(settings.DataDir, "blobs");
     string datDir = Path.Combine(settings.DataDir, "dats");
 
+    // Which branch each blob sits on, so that where a version exists twice the card can ask which
+    // branch is wanted instead of which checksum.
+    var (branches, branchOf) = changes.Branches(d);
+
     return Results.Ok(new
     {
         summary = Dto.Summary(d, names.Get(d.Id), names.DisplayFor(d.Id), names.SourceFor(d.Id)),
+        branches = branches.Select(b => new
+        {
+            b.Index, b.HeadCrc, b.MinVersion, b.MaxVersion,
+            b.FirstDate, b.LastDate, b.BlobCount, b.ForksFromVersion,
+        }),
         versions = Enumerable.Range(0, d.MaxVersion + 1).Select(v => new
         {
             version = v,
             dats = d.Dats.Where(e => e.Version == v).Select(e => Dto.File(e, datDir)),
-            blobs = d.Blobs.Where(e => e.Version == v).Select(e => Dto.File(e, blobDir)),
+            blobs = d.Blobs.Where(e => e.Version == v)
+                .Select(e => Dto.File(e, blobDir, branchOf.TryGetValue(e.FileName, out int bi) ? bi : null)),
         }).Where(x => x.dats.Any() || x.blobs.Any()),
     });
 });
@@ -1223,7 +1233,7 @@ internal static class Dto
         missingBlobs = d.MissingBlobs,
     };
 
-    public static object File(Entry e, string localDir) => new
+    public static object File(Entry e, string localDir, int? branch = null) => new
     {
         name = e.FileName,
         depot = e.Depot,
@@ -1234,6 +1244,9 @@ internal static class Dto
         size = e.ApproxSize,
         date = e.Date == default ? null : e.Date.ToString("yyyy-MM-dd HH:mm:ss"),
         local = System.IO.File.Exists(Path.Combine(localDir, e.FileName)),
+        // Which branch this blob belongs to, so a fork can be offered as a choice between branches
+        // rather than between two checksums that mean nothing on their own.
+        branch,
     };
 
     public static object Plan(ChainPlan p, Settings s) => new

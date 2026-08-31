@@ -540,7 +540,10 @@ function planPanel(s) {
 
   // Only shown when a version really forked. Everywhere else it sat there greyed out on "auto",
   // taking the space that the download size deserves.
-  const crcLabel = el('label', null, 'Blob CRC');
+  // Where a depot was reset, the same version number exists on two branches. The choice is which
+  // branch, not which checksum: a CRC identifies the blob exactly but tells the reader nothing
+  // about what they would be downloading, while "the newest branch, v0–v56" does.
+  const crcLabel = el('label', null, 'Branch');
   const crcSel = el('select');
   crcSel.id = 'planCrc';
   crcSel.append(new Option('auto', ''));
@@ -579,9 +582,31 @@ function planPanel(s) {
     const entry = state.detail.versions.find((x) => x.version === v);
     const choices = entry?.blobs ?? [];
 
+    const branches = state.detail.branches ?? [];
+
     crcSel.innerHTML = '';
-    crcSel.append(new Option('auto', ''));
-    for (const b of choices) crcSel.append(new Option(`${b.crc}  ·  ${b.date ? fmtDate(b.date) : ''}`, b.crc));
+    // Newest branch first, matching the version history above, so "the first one" means the same
+    // thing in both places.
+    const sorted = [...choices].sort((a, b) => (a.branch ?? 99) - (b.branch ?? 99));
+    crcSel.append(new Option(sorted.length > 1 ? 'newest branch' : 'auto', ''));
+
+    for (const b of sorted) {
+      const info = b.branch != null ? branches[b.branch] : null;
+      // The date is what separates two branches at a glance — the same version number written
+      // twice, years apart. The CRC stays in the tooltip for anyone who came for it.
+      const label = info
+        ? `Branch ${b.branch + 1} — v${info.minVersion}–v${info.maxVersion}`
+          + (b.date ? `, ${fmtDate(b.date)}` : '')
+        : `${b.crc}${b.date ? `  ·  ${fmtDate(b.date)}` : ''}`;
+
+      const opt = new Option(label, b.crc);
+      opt.title = info
+        ? `${info.blobCount} versions, `
+          + (info.forksFromVersion != null ? `forks from v${info.forksFromVersion}` : 'its own root')
+          + `  ·  blob CRC ${b.crc}`
+        : `blob CRC ${b.crc}`;
+      crcSel.append(opt);
+    }
 
     // Nothing to pick unless the version forked, so the control stays out of the way entirely.
     const choose = choices.length > 1;
@@ -748,8 +773,9 @@ function renderPlan(plan, out) {
     out.append(note('warn', 'Heads up', plan.warnings));
   }
   if (plan.needsChoice) {
-    out.append(note('info', 'Pick a blob',
-      'This version exists more than once. Choose a CRC above, then plan again.'));
+    out.append(note('info', 'Pick a branch',
+      'This depot was reset, so this version number exists on more than one branch. Choose which '
+      + 'one above, then plan again.'));
     return;
   }
   if (plan.error) return;

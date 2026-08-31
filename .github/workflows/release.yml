@@ -171,6 +171,20 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
+          # The smoke test runs the executable from inside publish/win-x64, and the app writes its
+          # working directory next to itself. Left in place it ships: tens of megabytes of index
+          # the release already embeds, the engine's cached torrent metadata, and a settings.json
+          # naming absolute paths on the runner - which is the one that would actually hurt, since
+          # a downloaded settings file pointing at D:\a\steam2_downloader is how you get an app
+          # insisting its archive lives somewhere that does not exist.
+          foreach ($rid in 'win-x64', 'linux-x64') {
+            if (Test-Path "publish/$rid/steam2info") {
+              $n = (Get-ChildItem "publish/$rid/steam2info" -Recurse -File).Count
+              Remove-Item -Recurse -Force "publish/$rid/steam2info"
+              Write-Host "removed $n file(s) the smoke test left in publish/$rid"
+            }
+          }
+
           Copy-Item README.md publish/win-x64/
           Copy-Item README.md publish/linux-x64/
           Compress-Archive -Path publish/win-x64/* -DestinationPath steam2browser-win-x64.zip -Force

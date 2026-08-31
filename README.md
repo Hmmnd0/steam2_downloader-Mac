@@ -40,8 +40,9 @@ is inside the executable. Release notes and older builds are on the
 Unzip and run `steam2browser.exe`.
 
 ```
-steam2browser.exe                 # opens http://127.0.0.1:5099
+steam2browser.exe                 # opens http://steam2downloader.localhost:5099
 steam2browser.exe --port=6000     # different port
+steam2browser.exe --port=80       # drops the port: http://steam2downloader.localhost
 steam2browser.exe --no-browser    # do not launch a browser
 ```
 
@@ -51,10 +52,19 @@ machine with no desktop session use `--no-browser` and open the address yourself
 
 ```
 chmod +x steam2browser
-./steam2browser                   # opens http://127.0.0.1:5099
+./steam2browser                   # opens http://steam2downloader.localhost:5099
 ./steam2browser --port=6000       # different port
 ./steam2browser --no-browser      # do not launch a browser
 ```
+
+The address is a name rather than a number. Anything under `.localhost` is reserved and resolved to
+loopback by the browser itself, so this needs no DNS, no hosts file entry and no administrator, and
+changes nothing on the machine. `http://127.0.0.1:5099` keeps working and is printed alongside it.
+
+Port 5099 is the default and nothing is taken that was not asked for. `--port=80` drops the port
+from the address entirely, which Windows generally allows without elevation; it is worth knowing
+that the app then holds the machine's HTTP port for as long as it runs, and that an ordinary user
+on Linux is not permitted to bind it at all.
 
 Everything it writes stays in `steam2info/` next to the executable: the name cache, downloads
 (`archive/blobs`, `archive/dats`) and extracted files (`extracted/`).

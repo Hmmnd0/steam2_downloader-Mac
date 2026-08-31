@@ -139,7 +139,25 @@ if (buildIndexAt >= 0)
     return 0;
 }
 
-// ---------------- port ----------------
+// ---------------- address ----------------
+
+// The name the app calls itself in a browser, in place of a bare loopback address.
+//
+// Anything under .localhost is reserved by RFC 6761 and resolved to loopback by the browser itself,
+// so this needs no DNS, no entry in the hosts file, and no administrator: nothing on the machine is
+// changed to make it work, and nothing is left behind. The alternatives all cost more than a nicer
+// address is worth — a hosts entry needs elevation and outlives the app, and mDNS would mean
+// listening on the network rather than on loopback, which is not a trade to make for an app that
+// downloads and writes files.
+//
+// A port still has to appear unless the app is on 80, which cannot be relied on: it is often taken,
+// and an ordinary user on Linux is not allowed to bind it at all. Passing --port=80 drops it and
+// leaves the bare name, wherever that does work.
+const string LocalHostName = "steam2downloader.localhost";
+
+static string AddressFor(int p) => p == 80
+    ? $"http://{LocalHostName}/"
+    : $"http://{LocalHostName}:{p}/";
 
 // Kestrel only discovers a busy port deep inside app.Run(), where the failure surfaces as a wall
 // of stack trace. Settle it here instead: hand the user over to an instance that is already
@@ -177,7 +195,7 @@ if (!PortIsFree(port))
 {
     if (await AnotherInstanceAsync(port))
     {
-        string running = $"http://127.0.0.1:{port}/";
+        string running = AddressFor(port);
         Console.WriteLine($"steam2browser is already running at {running} — opening that one");
 
         if (!noBrowser)
@@ -202,7 +220,11 @@ if (!PortIsFree(port))
 
 var builder = WebApplication.CreateBuilder(new WebApplicationOptions { Args = args, ContentRootPath = baseDir });
 builder.Logging.ClearProviders();
-builder.WebHost.UseUrls($"http://127.0.0.1:{port}");
+// "localhost" rather than 127.0.0.1, which binds both loopback addresses instead of only the IPv4
+// one. A browser resolving steam2.localhost is free to pick ::1, and on an IPv4-only listener that
+// arrives as a refused connection — the name would work on one machine and not the next for a
+// reason nobody could see. Still loopback either way: nothing is reachable from the network.
+builder.WebHost.UseUrls($"http://localhost:{port}");
 builder.Services.ConfigureHttpJsonOptions(o =>
 {
     o.SerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.CamelCase;
@@ -1099,8 +1121,13 @@ _ = Task.Run(async () =>
     names.StartSteam(loader.Catalog);
 });
 
-string url = $"http://127.0.0.1:{port}/";
+string url = AddressFor(port);
 Console.WriteLine($"steam2browser  ->  {url}");
+// The numeric address is printed too, and deliberately. Browsers resolve .localhost themselves, but
+// a curl on an unusual resolver, a script, or a machine with an aggressive DNS policy may not — and
+// somebody staring at a name that will not open needs the address that always works on the line
+// below, not in an issue thread.
+Console.WriteLine($"               or  http://127.0.0.1{(port == 80 ? "" : $":{port}")}/");
 Console.WriteLine($"data dir: {settings.DataDir}");
 Console.WriteLine("press Ctrl+C to stop");
 

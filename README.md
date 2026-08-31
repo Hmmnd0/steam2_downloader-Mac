@@ -1,5 +1,15 @@
 # Steam2 Downloader
 
+[![Latest release](https://img.shields.io/github/v/release/extremebleem/steam2_downloader?label=release&color=4c8b2b)](https://github.com/extremebleem/steam2_downloader/releases/latest)
+[![Total downloads](https://img.shields.io/github/downloads/extremebleem/steam2_downloader/total?label=downloads&color=4c8b2b)](https://github.com/extremebleem/steam2_downloader/releases)
+[![Stars](https://img.shields.io/github/stars/extremebleem/steam2_downloader?label=stars&color=4c8b2b)](https://github.com/extremebleem/steam2_downloader/stargazers)
+[![Build status](https://github.com/extremebleem/steam2_downloader/actions/workflows/release.yml/badge.svg)](https://github.com/extremebleem/steam2_downloader/actions/workflows/release.yml)
+![Windows and Linux, x64](https://img.shields.io/badge/platform-windows%20%7C%20linux-555)
+[![Written by Claude Code](https://img.shields.io/badge/written%20by-Claude%20Code-d97757)](https://claude.com/claude-code)
+![11,078 lines by Claude Code](https://img.shields.io/badge/lines%20by%20Claude%20Code-11%2C078-d97757)
+![62 lines from pull requests](https://img.shields.io/badge/lines%20from%20PRs-62-4c8b2b)
+![0 lines by the maintainer](https://img.shields.io/badge/lines%20by%20the%20maintainer-0-555)
+
 A desktop browser and downloader for the [terarelease](https://de.steam2.download/) Steam2 content
 dump: 10 876 depots, 116 339 files, 13.3 TB (12.1 TiB). It shows what the archive holds, resolves
 which files a given depot version actually needs, downloads them, verifies them and unpacks them.
@@ -13,6 +23,13 @@ A single self-contained executable for Windows and Linux. It starts a local serv
 your browser.
 
 ![Steam2 Downloader browsing depot 841 (Portal 2): the depot list, the delta chain planner with its download size estimate, and the version history expanded on v37 to show the four changed files.](assets/img1.png)
+
+Every line here was written by [Claude Code](https://claude.com/claude-code) or arrived in a pull
+request. The maintainer wrote none of it by hand: 11 078 of the 11 140 source lines came out of
+Claude Code sessions — the archive format work, the extractor, the chain planner and the interface —
+and the other 62 are the Linux support contributed by [SkyKingPX](https://github.com/SkyKingPX).
+Counted over `.cs`, `.js`, `.css`, `.html`, `.yml` and `.md`, excluding the depot key table, the
+catalog snapshot and other data files.
 
 ## Install and run
 

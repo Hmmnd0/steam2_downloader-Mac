@@ -10,7 +10,7 @@
     <GenerateEmbeddedFilesManifest>true</GenerateEmbeddedFilesManifest>
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>false</SelfContained>
-    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <RuntimeIdentifiers>win-x64;linux-x64</RuntimeIdentifiers>
     <ServerGarbageCollection>true</ServerGarbageCollection>
   </PropertyGroup>
 
@@ -20,7 +20,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <EmbeddedResource Include="wwwroot\**\*" />
+    <EmbeddedResource Include="wwwroot/**/*" />
     <EmbeddedResource Include="depotkeys.txt" LogicalName="Steam2Browser.depotkeys.txt" />
 
     <!--
@@ -29,6 +29,11 @@
       mirror. Not committed, so a plain clone still builds.
     -->
     <EmbeddedResource Include="index.bin" Condition="Exists('index.bin')" LogicalName="Steam2Browser.index.bin" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="../steam2.torrent" Link="steam2.torrent"
+          CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
   <!--

@@ -4,6 +4,17 @@ name: build and release
 "on":
   push:
     branches: [main]
+    # A release is 46 MB built from a 13 TB catalog snapshot; documentation and screenshots cannot
+    # change what it contains, so they do not earn one. apps/ has its own workflow and the app
+    # fetches apps.json at runtime rather than embedding it, so neither belongs here either.
+    # workflow_dispatch below still forces a build by hand whenever one is wanted anyway.
+    paths-ignore:
+      - '**.md'
+      - 'assets/**'
+      - 'apps/**'
+      - 'apps.json'
+      - '.gitignore'
+      - 'LICENSE'
   workflow_dispatch:
 
 # Needed so the release job can publish a release.

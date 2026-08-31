@@ -38,12 +38,60 @@ var torrent = new TorrentSource(settings);
 var changes = new ChangeIndex(client, settings);
 var downloads = new DownloadManager(client, settings, torrent, changes);
 var extractor = new ExtractorRunner(settings);
+var installs = new InstallManager(settings, client, changes, downloads, extractor);
 var updates = new UpdateChecker(http);
 updates.Initialise();
 var labels = new LabelSource(http);
+var apps = new AppCatalog(http);
 var fileSearch = new FileSearch(settings);
 var names = new NameCache(client, http, labels);
 names.Load(Settings.RootFor(baseDir));
+
+// Maintainer and CI tool: `--apps <folder>` reads the app definitions, reports anything wrong with
+// them and exits non-zero if there is. With `--out <path>` it also writes the combined file the
+// running app fetches. The archive catalog is loaded first so a definition pointing at a depot or
+// version that does not exist is caught before it can be merged.
+int appsAt = Array.FindIndex(args, a => a.Equals("--apps", StringComparison.OrdinalIgnoreCase));
+if (appsAt >= 0)
+{
+    string folder = Path.GetFullPath(appsAt + 1 < args.Length ? args[appsAt + 1] : "apps");
+
+    int outAt = Array.FindIndex(args, a => a.Equals("--out", StringComparison.OrdinalIgnoreCase));
+    string? combinedPath = outAt >= 0 && outAt + 1 < args.Length
+        ? Path.GetFullPath(args[outAt + 1])
+        : null;
+
+    Console.WriteLine($"checking app definitions in {folder}");
+
+    // Without a catalog the structure is still checked; only the existence tests are skipped.
+    await loader.LoadAsync(refreshIndex: false, withSizes: false);
+    var catalogForApps = loader.Catalog;
+    Console.WriteLine(catalogForApps is null
+        ? "  no catalog available — depot and version existence will not be checked"
+        : $"  catalog: {catalogForApps.Ordered.Count} depots");
+
+    var problems = AppCatalog.Validate(folder, catalogForApps, out var defined);
+
+    foreach (var line in problems) Console.Error.WriteLine($"  {line}");
+
+    if (problems.Count > 0)
+    {
+        Console.Error.WriteLine($"  {problems.Count} problem(s) found");
+        return 1;
+    }
+
+    int builds = defined.Sum(a => a.Builds.Count);
+    int pins = defined.Sum(a => a.Builds.Sum(b => b.Depots.Count));
+    Console.WriteLine($"  ok: {defined.Count} app(s), {builds} build(s), {pins} depot pin(s)");
+
+    if (combinedPath is not null)
+    {
+        AppCatalog.WriteCombined(combinedPath, defined);
+        Console.WriteLine($"  wrote {combinedPath} ({new FileInfo(combinedPath).Length / 1024.0:0.0} KB)");
+    }
+
+    return 0;
+}
 
 // Maintainer tool: `--build-index <path>` snapshots the whole catalog into one compact file, which
 // the build then embeds so a release needs no network on first run. Always pulls fresh from a
@@ -134,7 +182,7 @@ if (!PortIsFree(port))
 
         if (!noBrowser)
         {
-            try { Process.Start(new ProcessStartInfo(running) { UseShellExecute = true }); }
+            try { OpenWithDefaultApplication(running); }
             catch { /* the URL is printed above */ }
         }
         return 0;
@@ -209,6 +257,8 @@ app.MapGet("/api/state", () => new
         settings.DatConcurrency,
         settings.WarmupLookahead,
         settings.BigFileBytes,
+        settings.TorrentEnabled,
+        settings.SeedDownloaded,
         settings.VerifyHashes,
         settings.TorrentPort,
         settings.ExtractOutDir,
@@ -305,6 +355,23 @@ app.MapPost("/api/settings", async (SettingsPatch patch) =>
     if (patch.BlobConcurrency is { } bc) settings.BlobConcurrency = Math.Clamp(bc, 1, 128);
     if (patch.DatConcurrency is { } dc) settings.DatConcurrency = Math.Clamp(dc, 1, 64);
     if (patch.WarmupLookahead is { } wl) settings.WarmupLookahead = Math.Clamp(wl, 0, 16);
+    if (patch.TorrentEnabled is { } te)
+    {
+        settings.TorrentEnabled = te;
+
+        if (!te)
+        {
+            // Off means off: sharing stops, the manager stops, and the engine is disposed. Merely
+            // refusing to start again would leave a half-started engine running for the session.
+            await torrent.StopSeedingAsync();
+            await torrent.ResetAsync();
+        }
+        else if (settings.SeedDownloaded)
+        {
+            _ = Task.Run(() => torrent.StartSeedingAsync());
+        }
+    }
+
     if (patch.BigFileMb is { } bm) settings.BigFileBytes = Math.Max(0, bm) * 1_000_000L;
     if (patch.VerifyHashes is { } vh) settings.VerifyHashes = vh;
     if (patch.TorrentPort is { } tp)
@@ -630,6 +697,110 @@ app.MapGet("/api/depots/{id:int}/needed", (int id, int version) =>
     });
 });
 
+app.MapGet("/api/seed", () =>
+{
+    torrent.SampleSeed();
+    var st = torrent.Status;
+
+    return Results.Ok(new
+    {
+        enabled = settings.TorrentEnabled && settings.SeedDownloaded,
+        engineEnabled = settings.TorrentEnabled,
+        state = st.SeedState,
+        message = st.SeedMessage,
+        files = st.SeedFiles,
+        bytes = st.SeedBytes,
+        uploadRate = st.SeedUploadRate,
+        uploaded = st.SeedUploaded,
+        peers = st.SeedPeers,
+    });
+});
+
+app.MapPost("/api/seed", async (SeedRequest req) =>
+{
+    settings.SeedDownloaded = req.Enabled;
+    settings.Save();
+
+    if (req.Enabled && settings.TorrentEnabled) _ = Task.Run(() => torrent.StartSeedingAsync());
+    else await torrent.StopSeedingAsync();
+
+    return Results.Ok(new { ok = true, enabled = settings.SeedDownloaded });
+});
+
+app.MapPost("/api/installs", (InstallRequest req) =>
+{
+    var cat = loader.Catalog;
+    if (cat is null) return Results.BadRequest(new { error = "index not loaded yet" });
+
+    var app0 = apps.Apps.FirstOrDefault(a => a.Appid == req.Appid);
+    if (app0 is null) return Results.NotFound(new { error = $"no app {req.Appid}" });
+
+    var build = app0.Builds.FirstOrDefault(b => b.Id == req.Build);
+    if (build is null) return Results.NotFound(new { error = $"no build '{req.Build}'" });
+
+    // The client sends which depots it wants, since optional ones are its to choose. Anything not
+    // in the build is ignored rather than trusted.
+    var wanted = req.Depots is { Count: > 0 }
+        ? build.Depots.Where(d => req.Depots.Contains(d.Depot)).ToList()
+        : build.Depots.Where(d => !d.Optional).ToList();
+
+    if (wanted.Count == 0) return Results.BadRequest(new { error = "nothing selected" });
+
+    var install = installs.Start(cat, app0, build, wanted, names.DisplayFor);
+    return Results.Ok(new { installId = install.Id });
+});
+
+app.MapGet("/api/installs", () => Results.Ok(installs.All.Select(Dto.Install)));
+
+app.MapPost("/api/installs/{id}/cancel", (string id) =>
+    installs.Cancel(id) ? Results.Ok(new { ok = true }) : Results.NotFound());
+
+app.MapGet("/api/apps", () =>
+{
+    var cat = loader.Catalog;
+
+    return Results.Ok(new
+    {
+        status = new
+        {
+            apps.Status.State,
+            apps.Status.Message,
+            apps.Status.Source,
+            apps.Status.Count,
+            apps.Status.FetchedUtc,
+        },
+        items = apps.Apps.Select(a => new
+        {
+            a.Appid,
+            a.Name,
+            builds = a.Builds.Select(b => new
+            {
+                b.Id,
+                b.Name,
+                b.Date,
+                b.Notes,
+                depots = b.Depots.Select(d =>
+                {
+                    var depot = cat?.Ordered.FirstOrDefault(x => x.Id == d.Depot);
+
+                    return new
+                    {
+                        d.Depot,
+                        d.Version,
+                        d.Role,
+                        d.Optional,
+                        // Resolved here so a definition never repeats what the catalog already says,
+                        // and so a pin that no longer resolves is visible instead of silent.
+                        name = depot is null ? null : names.DisplayFor(d.Depot),
+                        known = depot is not null && depot.Blobs.Any(x => x.Version == d.Version),
+                        maxVersion = depot?.MaxVersion ?? -1,
+                    };
+                }),
+            }),
+        }),
+    });
+});
+
 app.MapPost("/api/blobs/range", (BlobRangeRequest req) =>
 {
     if (loader.Catalog is null) return Results.BadRequest(new { error = "index not loaded yet" });
@@ -764,7 +935,15 @@ app.MapPost("/api/jobs/clear", () => { downloads.Clear(); return Results.Ok(new 
 
 app.MapPost("/api/extract", (ExtractRequest req) =>
 {
-    var run = extractor.Start(req.Depot, req.Version, req.BlobCrc, req.Filter, req.KeyHex);
+    // Extracted files are stamped with the date of the version that wrote them, which only the
+    // catalog knows. Blob dates rather than dat dates: dat timestamps collapse in the dump, with
+    // depot 205 showing 102 dats across 26 distinct values, while its blobs carry 102.
+    var dates = loader.Catalog?.Ordered
+        .FirstOrDefault(d => d.Id == req.Depot)?.Blobs
+        .GroupBy(b => b.Version)
+        .ToDictionary(g => g.Key, g => g.Max(b => b.Date));
+
+    var run = extractor.Start(req.Depot, req.Version, req.BlobCrc, req.Filter, req.KeyHex, dates);
     return Results.Ok(new { runId = run.Id });
 });
 
@@ -824,6 +1003,12 @@ _ = Task.Run(async () =>
     names.Refresh();
 });
 
+_ = Task.Run(() => apps.RefreshAsync(Settings.RootFor(baseDir)));
+
+// Both switches have to be on. The engine is off by default while its startup is unexplained.
+if (settings.TorrentEnabled && settings.SeedDownloaded)
+    _ = Task.Run(() => torrent.StartSeedingAsync());
+
 _ = Task.Run(async () =>
 {
     // Cached curated names first: they cover the whole archive today, which means both sweeps
@@ -832,6 +1017,7 @@ _ = Task.Run(async () =>
     // because that fetch can sit on an unreachable host for the whole timeout and the index is
     // the one thing the UI cannot render without.
     await labels.LoadCachedAsync(Settings.RootFor(baseDir));
+    await apps.LoadCachedAsync(Settings.RootFor(baseDir));
     names.Refresh();
 
     await loader.LoadAsync(refreshIndex: false, withSizes: true);
@@ -866,7 +1052,7 @@ Console.WriteLine("press Ctrl+C to stop");
 
 if (!noBrowser)
 {
-    try { Process.Start(new ProcessStartInfo(url) { UseShellExecute = true }); }
+    try { OpenWithDefaultApplication(url); }
     catch { /* headless is fine, the URL is printed above */ }
 }
 
@@ -886,13 +1072,38 @@ return 0;
 
 // ---------------- request bodies ----------------
 
+static void OpenWithDefaultApplication(string target)
+{
+    if (OperatingSystem.IsLinux())
+    {
+        var startInfo = new ProcessStartInfo("xdg-open") { UseShellExecute = false };
+        startInfo.ArgumentList.Add(target);
+        Process.Start(startInfo);
+        return;
+    }
+
+    if (OperatingSystem.IsMacOS())
+    {
+        var startInfo = new ProcessStartInfo("open") { UseShellExecute = false };
+        startInfo.ArgumentList.Add(target);
+        Process.Start(startInfo);
+        return;
+    }
+
+    // Shell execution lets Windows select Explorer for directories and the default browser
+    // for URLs without hard-coding a Windows executable into the rest of the application.
+    Process.Start(new ProcessStartInfo(target) { UseShellExecute = true });
+}
+
 internal sealed record SettingsPatch(
-    string? MirrorId, bool? Failover, int? Concurrency, bool? VerifyHashes, bool? PhasedDownloads, int? BlobConcurrency, int? DatConcurrency, int? WarmupLookahead, int? BigFileMb,
+    string? MirrorId, bool? Failover, int? Concurrency, bool? VerifyHashes, bool? PhasedDownloads, bool? TorrentEnabled, int? BlobConcurrency, int? DatConcurrency, int? WarmupLookahead, int? BigFileMb,
     int? TorrentPort, string? DataDir, string? ExtractOutDir, string[]? ExtraTrackers);
 
 internal sealed record ReloadRequest(bool Refresh, bool Sizes);
 internal sealed record PlanRequest(int Depot, int Version, string? BlobCrc);
 internal sealed record BlobRangeRequest(int From, int To);
+internal sealed record InstallRequest(int Appid, string Build, List<int>? Depots);
+internal sealed record SeedRequest(bool Enabled);
 internal sealed record ExtractRequest(int Depot, int Version, string? BlobCrc, string? Filter, string? KeyHex);
 internal sealed record RevealRequest(string Path);
 
@@ -981,6 +1192,38 @@ internal static class Dto
 
     /// <summary>Set once at startup; the DTO needs a mirror to build absolute file URLs.</summary>
     public static Func<Mirror> PlanHost = () => Mirrors.All[0];
+
+    public static object Install(Install i) => new
+    {
+        id = i.Id,
+        appid = i.Appid,
+        name = i.AppName,
+        build = i.BuildId,
+        outDir = i.OutDir,
+        status = i.Status,
+        error = i.Error,
+        started = i.StartedUtc,
+        finished = i.FinishedUtc,
+        steps = i.Steps.Select(s => new
+        {
+            s.Depot,
+            s.Version,
+            s.Role,
+            s.Name,
+            s.Status,
+            s.Error,
+            s.TotalBytes,
+            s.DoneBytes,
+            s.FilesWritten,
+            s.JobId,
+            s.RunId,
+        }),
+        // Summed here so the panel can draw one bar for the whole install.
+        totalBytes = i.Steps.Sum(s => Math.Max(0, s.TotalBytes)),
+        doneBytes = i.Steps.Sum(s => Math.Max(0, s.DoneBytes)),
+        doneSteps = i.Steps.Count(s => s.Status == "done"),
+        log = i.Log.ToArray(),
+    };
 
     public static object Job(DownloadJob j) => new
     {

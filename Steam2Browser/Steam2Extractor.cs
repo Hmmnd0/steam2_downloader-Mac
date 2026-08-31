@@ -73,15 +73,57 @@ public sealed class Steam2Extractor
                 dats[v] = list[0].Path;
             }
 
-            // Every blob is required: the file id table is assembled from all of them. A dat is not,
-            // because a version whose writes were all superseded contributes nothing to this target.
-            // Which dats genuinely matter is only knowable once that table exists, so the check for
-            // a missing one that is actually referenced happens in ExtractAsync.
-            for (int v = version; v >= 0; v--)
-                if (!blobs.ContainsKey(v))
-                    throw new InvalidDataException($"missing a blob for version {v}");
+            // Version numbers are not contiguous. Depot 242 has no version between 7 and 16 at
+            // all, so walking the integers and demanding a blob for each one rejects a chain that
+            // is perfectly intact. What links a version to its predecessor is the parent CRC
+            // recorded inside its blob, and that is what has to be followed.
+            //
+            // Every blob along that walk is required, because the file id table is assembled from
+            // all of them. A dat is not: a version whose writes were all superseded contributes
+            // nothing to this target, and which dats genuinely matter is only knowable once that
+            // table exists — so that check happens in ExtractAsync.
+            if (!blobs.TryGetValue(version, out string? headPath))
+                throw new InvalidDataException($"missing a blob for version {version}");
 
-            return new Chain(dats, blobs);
+            var walkedBlobs = new SortedDictionary<int, string>();
+            var walkedDats = new SortedDictionary<int, string>();
+
+            string? cursor = headPath;
+            int cursorVersion = version;
+
+            while (cursor is not null)
+            {
+                walkedBlobs[cursorVersion] = cursor;
+                if (dats.TryGetValue(cursorVersion, out string? datPath)) walkedDats[cursorVersion] = datPath;
+
+                var info = BlobFormat.Parse(File.ReadAllBytes(cursor));
+                // A parent CRC of zero marks a chain root. Depot 242 lost versions 7 to 16 and
+                // starts afresh at 17, so the walk ends there rather than looking for a parent
+                // that was never meant to exist.
+                if (cursorVersion == 0 || info.ParentCrc is not uint parentCrc || parentCrc == 0) break;
+
+                // The parent is whichever earlier version carries that CRC, not simply v-1.
+                var found = blobFiles
+                    .Where(kv => kv.Key < cursorVersion)
+                    .OrderByDescending(kv => kv.Key)
+                    .Select(kv => new
+                    {
+                        Version = kv.Key,
+                        Blob = kv.Value.FirstOrDefault(b =>
+                            uint.TryParse(b.Crc, System.Globalization.NumberStyles.HexNumber, null, out uint c)
+                            && c == parentCrc),
+                    })
+                    .FirstOrDefault(x => x.Blob is not null);
+
+                if (found is null)
+                    throw new InvalidDataException(
+                        $"no blob with crc {parentCrc:x8} below version {cursorVersion} — the chain is broken");
+
+                cursor = found.Blob!.Path;
+                cursorVersion = found.Version;
+            }
+
+            return new Chain(walkedDats, walkedBlobs);
         }
 
         if (!blobFiles.TryGetValue(version, out var heads))
@@ -168,7 +210,8 @@ public sealed class Steam2Extractor
         byte[]? keyOverride,
         ExtractProgress progress,
         Action<string> log,
-        CancellationToken ct)
+        CancellationToken ct,
+        IReadOnlyDictionary<int, DateTime>? datesByVersion = null)
     {
         // Not every depot is encrypted. Files carry a filemode: 1 is plain zlib and needs no key at
         // all, only 2 and 3 involve AES. So the key is fetched here but demanded later, and only if
@@ -253,7 +296,7 @@ public sealed class Steam2Extractor
 
                 try
                 {
-                    WriteOne(node, fileIds, dats, key, outDir, chunk, inflated, progress);
+                    WriteOne(node, fileIds, dats, key, outDir, chunk, inflated, progress, datesByVersion);
                     progress.DoneFiles++;
                 }
                 catch (OperationCanceledException) { throw; }
@@ -281,7 +324,8 @@ public sealed class Steam2Extractor
         string outDir,
         byte[] chunk,
         byte[] inflated,
-        ExtractProgress progress)
+        ExtractProgress progress,
+        IReadOnlyDictionary<int, DateTime>? datesByVersion)
     {
         if (!fileIds.TryGetValue(node.FileId, out var loc))
             throw new InvalidDataException($"file id {node.FileId} is not in the table");
@@ -292,22 +336,43 @@ public sealed class Steam2Extractor
         string full = SafePath(outDir, node.Path);
         Directory.CreateDirectory(Path.GetDirectoryName(full)!);
 
-        using var output = new FileStream(full, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20);
-
-        long offset = (long)loc.Offset;
-        foreach (var block in loc.Blocks)
+        using (var output = new FileStream(full, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20))
         {
-            if (block.CompressedSize == 0) continue;
-            if (block.CompressedSize > MaxChunk)
-                throw new InvalidDataException($"chunk of {block.CompressedSize} bytes is impossible");
+            long offset = (long)loc.Offset;
+            foreach (var block in loc.Blocks)
+            {
+                if (block.CompressedSize == 0) continue;
+                if (block.CompressedSize > MaxChunk)
+                    throw new InvalidDataException($"chunk of {block.CompressedSize} bytes is impossible");
 
-            dat.Position = offset;
-            dat.ReadExactly(chunk, 0, (int)block.CompressedSize);
+                dat.Position = offset;
+                dat.ReadExactly(chunk, 0, (int)block.CompressedSize);
 
-            int written = HandleChunk(chunk, (int)block.CompressedSize, loc.FileMode, key, inflated, output);
-            progress.BytesWritten += written;
+                int written = HandleChunk(chunk, (int)block.CompressedSize, loc.FileMode, key, inflated, output);
+                progress.BytesWritten += written;
 
-            offset += block.CompressedSize;
+                offset += block.CompressedSize;
+            }
+        }
+
+        // Dated by the version that wrote the file, not by when it was unpacked. There is no
+        // per-file timestamp anywhere in the format — the manifest node has seven fields and all
+        // are accounted for — so the version's own date is the finest granularity that exists, and
+        // it is the true one: a file untouched since v0 keeps v0's date while its neighbour
+        // rewritten at v56 carries that.
+        //
+        // The blob's date is used rather than the dat's. Both are recorded, but dat dates collapse
+        // — depot 205 has 102 dats sharing 26 distinct timestamps — while its blobs carry 102.
+        if (datesByVersion is not null && datesByVersion.TryGetValue(loc.Part, out var stamp))
+        {
+            try
+            {
+                File.SetLastWriteTimeUtc(full, DateTime.SpecifyKind(stamp, DateTimeKind.Utc));
+            }
+            catch
+            {
+                // Cosmetic. A file that cannot be stamped is still correctly extracted.
+            }
         }
     }
 

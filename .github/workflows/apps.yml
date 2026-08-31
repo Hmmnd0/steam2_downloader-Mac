@@ -1,0 +1,59 @@
+name: app definitions
+
+# Quoted: bare `on` is the boolean true in YAML 1.1, which trips up local linters.
+"on":
+  pull_request:
+    paths: ['apps/**']
+  push:
+    branches: [main]
+    paths: ['apps/**']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      # Structure, duplicate appids, file names, and — the part that matters — whether every
+      # (depot, version) a build names actually exists in the archive. A definition that points at
+      # a version nobody can download is worse than no definition at all, so this fails the PR.
+      - name: Validate apps/
+        run: |
+          # Absolute paths on purpose. `dotnet run --project` runs with the project folder as
+          # the working directory, so a relative "apps" resolved to Steam2Browser/apps and the
+          # check failed with "does not exist" while the folder sat in the repository root.
+          dotnet run --project Steam2Browser/Steam2Browser.csproj -c Release -- --apps '${{ github.workspace }}/apps'
+
+      # Contributors edit one file per app; the running client fetches a single combined file,
+      # because the GitHub API allows an unauthenticated caller 60 requests an hour and a
+      # request-per-app would exhaust that. Regenerating it here keeps the two in step without
+      # anyone having to remember.
+      - name: Rebuild apps.json
+        if: github.event_name == 'push'
+        run: |
+          dotnet run --project Steam2Browser/Steam2Browser.csproj -c Release -- \
+            --apps '${{ github.workspace }}/apps' --out '${{ github.workspace }}/apps.json'
+
+      - name: Commit apps.json if it changed
+        if: github.event_name == 'push'
+        run: |
+          if git diff --quiet -- apps.json; then
+            echo "apps.json already matches apps/"
+            exit 0
+          fi
+
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add apps.json
+          # skip ci: this commit only regenerates a derived file, and rerunning on it would loop.
+          git commit -m 'rebuild apps.json from apps/ [skip ci]'
+          git push

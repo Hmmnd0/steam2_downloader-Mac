@@ -301,10 +301,27 @@ public sealed class ArchiveClient(HttpClient http)
         Mirror mirror, Entry entry, string partPath, long resumeFrom,
         Action<long, long>? onProgress, CancellationToken ct)
     {
-        if (UseSegments && entry.Kind == Kind.Dat && (entry.ApproxSize < 0 || entry.ApproxSize >= SegmentedThresholdBytes))
+        // Measured on one 53 MB dat: de refuses to serve ranges for dats and sustains 0.43 MB/s
+        // on its single stream, while ro serves them and reaches 3.48 MB/s across sixteen. So the
+        // question is not whether the user asked for segments, it is whether this mirror will
+        // honour them — a mirror already known to ignore Range is left on a plain download.
+        bool canSegment = entry.Kind == Kind.Dat
+                          && HonoursRange(mirror, entry.Kind) != false
+                          && (entry.ApproxSize < 0 || entry.ApproxSize >= SegmentedThresholdBytes);
+
+        if (canSegment)
         {
-            var segmented = await TryPullSegmentedAsync(mirror, entry, partPath, resumeFrom, onProgress, ct);
-            if (segmented is not null) return segmented.Value;
+            try
+            {
+                var segmented = await TryPullSegmentedAsync(mirror, entry, partPath, resumeFrom, onProgress, ct);
+                if (segmented is not null) return segmented.Value;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // Falling back to one stream is always possible, so a mirror that will not segment
+                // costs this file its speed rather than the download itself.
+                _honoursRange[(mirror.Id, entry.Kind)] = false;
+            }
         }
 
         using var req = new HttpRequestMessage(HttpMethod.Get, mirror.Url(entry.RelPath));

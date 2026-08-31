@@ -39,9 +39,13 @@ public sealed class ExtractorRunner(Settings settings)
     public IReadOnlyCollection<ExtractRun> Runs => _runs.Values.ToArray();
     public ExtractRun? Get(string id) => _runs.GetValueOrDefault(id);
 
-    public ExtractRun Start(int depot, int version, string? blobCrc, string? filter, string? keyHex)
+    public ExtractRun Start(int depot, int version, string? blobCrc, string? filter, string? keyHex,
+                            IReadOnlyDictionary<int, DateTime>? datesByVersion = null,
+                            string? outDirOverride = null)
     {
-        string outDir = Path.Combine(settings.ExtractOutDir, $"{depot}_{version}");
+        // An app install passes its own folder: the depots of a game overlay into one tree rather
+        // than sitting in a directory each.
+        string outDir = outDirOverride ?? Path.Combine(settings.ExtractOutDir, $"{depot}_{version}");
 
         var run = new ExtractRun
         {
@@ -68,7 +72,7 @@ public sealed class ExtractorRunner(Settings settings)
 
                 Steam2Extractor.Extract(
                     settings.DataDir, depot, version, blobCrc, filter, outDir,
-                    key, run.Progress, run.Say, run.Cts.Token);
+                    key, run.Progress, run.Say, run.Cts.Token, datesByVersion);
 
                 run.Status = run.Progress.FailedFiles > 0 ? "failed" : "done";
                 if (run.Progress.FailedFiles > 0)

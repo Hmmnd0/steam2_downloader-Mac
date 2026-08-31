@@ -197,13 +197,6 @@ looks at the filemodes.
 Those are flagged `incomplete`, because extraction fails partway through. 303 depots were reset at
 some point.
 
-**The mirrors are not interchangeable in behaviour.** They serve identical bytes, but `de` advertises
-`Accept-Ranges` and then ignores a `Range` header on `.dat` files, answering `200` with the whole
-body instead of `206`. Directory listings are sent chunked with no `Content-Length` at all. Both are
-handled: a partial file is never appended to a full-body response, and an interrupted download picks
-between resuming on a mirror that honours ranges and restarting on a faster one, whichever finishes
-sooner.
-
 ## Build from source
 
 Needs the .NET 10 SDK.

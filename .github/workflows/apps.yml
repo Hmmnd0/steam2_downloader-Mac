@@ -28,7 +28,10 @@ jobs:
       # a version nobody can download is worse than no definition at all, so this fails the PR.
       - name: Validate apps/
         run: |
-          dotnet run --project Steam2Browser/Steam2Browser.csproj -c Release -- --apps apps
+          # Absolute paths on purpose. `dotnet run --project` runs with the project folder as
+          # the working directory, so a relative "apps" resolved to Steam2Browser/apps and the
+          # check failed with "does not exist" while the folder sat in the repository root.
+          dotnet run --project Steam2Browser/Steam2Browser.csproj -c Release -- --apps '${{ github.workspace }}/apps'
 
       # Contributors edit one file per app; the running client fetches a single combined file,
       # because the GitHub API allows an unauthenticated caller 60 requests an hour and a
@@ -38,7 +41,7 @@ jobs:
         if: github.event_name == 'push'
         run: |
           dotnet run --project Steam2Browser/Steam2Browser.csproj -c Release -- \
-            --apps apps --out apps.json
+            --apps '${{ github.workspace }}/apps' --out '${{ github.workspace }}/apps.json'
 
       - name: Commit apps.json if it changed
         if: github.event_name == 'push'

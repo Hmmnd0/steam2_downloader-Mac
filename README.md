@@ -9,21 +9,35 @@ chains of `.dat` payloads with `.blob` metadata beside them, so no single file i
 version — extracting version *N* needs every version below it. This tool exists because working
 that out by hand across 58 441 blobs is not practical.
 
-Single self-contained executable for Windows. It starts a local server and opens your browser.
+A single self-contained executable for Windows and Linux. It starts a local server and opens
+your browser.
 
 ![Steam2 Downloader browsing depot 841 (Portal 2): the depot list, the delta chain planner with its download size estimate, and the version history expanded on v37 to show the four changed files.](assets/img1.png)
 
 ## Install and run
 
-[Download `steam2browser-win-x64.zip`](https://github.com/extremebleem/steam2_downloader/releases/latest/download/steam2browser-win-x64.zip)
-— that link always resolves to the newest build. Unzip and run `steam2browser.exe`. No .NET
-install, no dependencies. Release notes and older builds are on the
+Both links always resolve to the newest build. No .NET install and no dependencies — the runtime
+is inside the executable. Release notes and older builds are on the
 [releases page](https://github.com/extremebleem/steam2_downloader/releases/latest).
+
+**Windows** — [`steam2browser-win-x64.zip`](https://github.com/extremebleem/steam2_downloader/releases/latest/download/steam2browser-win-x64.zip).
+Unzip and run `steam2browser.exe`.
 
 ```
 steam2browser.exe                 # opens http://127.0.0.1:5099
 steam2browser.exe --port=6000     # different port
 steam2browser.exe --no-browser    # do not launch a browser
+```
+
+**Linux** — [`steam2browser-linux-x64.zip`](https://github.com/extremebleem/steam2_downloader/releases/latest/download/steam2browser-linux-x64.zip).
+Unzip, mark it executable once, then run it. The browser is opened through `xdg-open`, so on a
+machine with no desktop session use `--no-browser` and open the address yourself.
+
+```
+chmod +x steam2browser
+./steam2browser                   # opens http://127.0.0.1:5099
+./steam2browser --port=6000       # different port
+./steam2browser --no-browser      # do not launch a browser
 ```
 
 Everything it writes stays in `steam2info/` next to the executable: the name cache, downloads
@@ -129,13 +143,22 @@ Release build:
 
 ```
 dotnet publish Steam2Browser/Steam2Browser.csproj -c Release -r win-x64 --self-contained true \
-  -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true -o out
+  -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true -o out/win-x64
+
+dotnet publish Steam2Browser/Steam2Browser.csproj -c Release -r linux-x64 --self-contained true \
+  -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true -o out/linux-x64
 ```
+
+Either target builds from either host, which is how the release workflow produces both from one
+runner.
 
 ## Credits
 
 The archive, the original C++ extractor and the depot key table come from the terarelease dump.
 Please mirror and seed it.
+
+Linux support was contributed by [SkyKingPX](https://github.com/SkyKingPX) in
+[#6](https://github.com/extremebleem/steam2_downloader/pull/6).
 
 Depot names come from [dr3murr/steam2-winfsp](https://github.com/dr3murr/steam2-winfsp), whose
 [`data/depot_labels.tsv`](https://github.com/dr3murr/steam2-winfsp/blob/main/data/depot_labels.tsv)

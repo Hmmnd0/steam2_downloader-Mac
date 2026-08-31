@@ -1062,12 +1062,20 @@ _ = Task.Run(async () =>
     try
     {
         await Mirrors.TestAllAsync(http);
-        var best = Mirrors.All.Where(m => !m.IsTorrent && m.Reachable && m.SpeedBps > 0).MaxBy(m => m.SpeedBps);
-        if (best is not null && best.Id != client.Primary.Id)
+
+        // Racing the HTTP mirrors says nothing about the swarm, so someone who chose the swarm is
+        // left on it. Without this the race quietly moved them back to an HTTP mirror a few seconds
+        // into every start, and the only symptom was that picking the torrent never seemed to do
+        // anything — which is exactly what it looked like from the outside.
+        if (!client.Primary.IsTorrent)
         {
-            client.Primary = best;
-            settings.MirrorId = best.Id;
-            settings.Save();
+            var best = Mirrors.All.Where(m => !m.IsTorrent && m.Reachable && m.SpeedBps > 0).MaxBy(m => m.SpeedBps);
+            if (best is not null && best.Id != client.Primary.Id)
+            {
+                client.Primary = best;
+                settings.MirrorId = best.Id;
+                settings.Save();
+            }
         }
     }
     catch

@@ -94,6 +94,24 @@ public sealed class TorrentSource(Settings settings)
     private IReadOnlyList<ITorrentManagerFile> _selection = Array.Empty<ITorrentManagerFile>();
 
     /// <summary>
+    /// Set when sharing wanted to take stock of the disk but a download was using the manager, so
+    /// the work is done once that download is out of the way instead of on top of it.
+    /// </summary>
+    private volatile bool _seedRefreshPending;
+
+    /// <summary>
+    /// Whether a download currently owns the manager.
+    ///
+    /// Downloading and sharing are the same manager and the same picker, and sharing's half of that
+    /// begins by clearing the selection and stopping the manager. Doing so while a download is in
+    /// flight takes away both the files it asked for and the engine fetching them, and the download
+    /// then sits at zero forever because nothing is left to tell it otherwise. That is what made
+    /// downloading over the torrent look broken to anyone who left sharing on — which is everyone,
+    /// since it is on by default.
+    /// </summary>
+    private bool DownloadInFlight => _selection.Count > 0;
+
+    /// <summary>
     /// Ready means the file list is known and the selection picker is on: without the picker a
     /// download would select files the manager knows nothing about and start on all 13.32 TB.
     /// </summary>
@@ -180,6 +198,13 @@ public sealed class TorrentSource(Settings settings)
                 Status.SeedState = "idle";
                 // The sweep's own account of what it rejected is left in place: at zero that is the
                 // only thing worth reading, and a friendlier sentence would hide it.
+                return;
+            }
+
+            if (DownloadInFlight)
+            {
+                Status.SeedMessage = "waiting for the download to finish before sharing";
+                _seedRefreshPending = true;
                 return;
             }
 
@@ -367,6 +392,14 @@ public sealed class TorrentSource(Settings settings)
             if (linked <= before)
             {
                 Status.SeedMessage = $"sharing {linked} file(s)";
+                return;
+            }
+
+            if (DownloadInFlight)
+            {
+                // The new files are not going anywhere. Taking them in costs a stop and a hash
+                // check, and doing that now would kill the download that is still running.
+                _seedRefreshPending = true;
                 return;
             }
 
@@ -808,7 +841,35 @@ public sealed class TorrentSource(Settings settings)
         Status.State = "ready";
         Status.Message = $"finished {selected.Count - missing.Count} of {selected.Count} files";
 
+        // The manager is free again, so anything sharing put off while it was busy runs now.
+        _ = RunPendingSeedRefreshAsync();
+
         return missing;
+    }
+
+    /// <summary>
+    /// Does the sharing work that was deferred while a download held the manager.
+    ///
+    /// Which of the two it is depends on how far sharing had got: one that never finished starting
+    /// has to start, and one already sharing only needs to notice what arrived.
+    /// </summary>
+    private async Task RunPendingSeedRefreshAsync()
+    {
+        if (!_seedRefreshPending) return;
+        _seedRefreshPending = false;
+
+        if (!settings.TorrentEnabled || !settings.SeedDownloaded) return;
+
+        try
+        {
+            if (Status.SeedState == "sharing") await RefreshSharingAsync(CancellationToken.None);
+            else await StartSeedingAsync();
+        }
+        catch
+        {
+            // Sharing failing to catch up is not the download's problem, and the next completed
+            // download tries again.
+        }
     }
 
     /// <summary>

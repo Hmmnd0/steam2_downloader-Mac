@@ -86,8 +86,11 @@ async function refreshState() {
   try { s = await api.get('/api/state'); } catch { return; }
 
   state.settings = s.settings;
+  state.disk = s.disk;
+  renderDisk(s.disk);
   $('#loadStatus').textContent = s.status.error ? `error: ${s.status.error}` : s.status.message || s.status.phase;
   applyLoading(s.status);
+  maybeTellAboutSharing();
 
 // Nothing on this page means anything until the index is in memory: the depot list is empty, the
 // file search has nothing to match against and a blob range has no depot ids to resolve. So the
@@ -135,38 +138,52 @@ function applyLoading(status) {
 
   const c = s.catalog;
   if (c) {
+    // What the archive is, in two numbers. Dats and blobs, resets, incomplete depots, naming and
+    // the Steam lookup all used to sit here too, and between them they took most of the header —
+    // room the sharing button needs to name the stage it is on. The counts that were dropped are
+    // either visible where they matter (a depot's own card says if it is incomplete or a reset) or
+    // were never something to act on. The two background passes keep their progress in the tooltip.
+    const passes = [
+      s.names.running ? `naming depots — ${num(s.names.remaining)} left` : '',
+      s.steam.running ? `asking Steam — ${num(s.steam.remaining)} left` : '',
+    ].filter(Boolean).join('  ·  ');
+
     renderStats([
-      ['depots', num(c.depots), 'depots', false],
-      // Dats and blobs come in pairs, so one cell says as much as two did in half the width.
-      ['files', `${num(c.dats)} / ${num(c.blobs)}`, 'dats / blobs', false],
-      ['size', c.sizesLoaded ? '~' + bytes(c.totalBytes) : '…', 'size', false],
-      ['resets', num(c.resetDepots), 'resets', false],
-      ['incomplete', num(c.incompleteDepots), 'incomplete', false],
-      // Named counts every source, so it is a share of the whole archive. While a pass is
-      // running the label says how much is left rather than restating the same fraction.
-      ['named', `${num(s.names.named)} / ${num(c.depots)}`,
-        s.names.running ? `naming — ${num(s.names.remaining)} left` : 'named', s.names.running],
-      // Value is what Steam actually recognised. "checked" accumulates across runs while
-      // "remaining" is this run's queue, so adding them made a denominator that meant nothing.
-      ['steam', num(s.steam.found),
-        s.steam.running ? `steam — ${num(s.steam.remaining)} left` : 'via steam',
-        s.steam.running],
+      ['depots', num(c.depots), 'depots', s.names.running || s.steam.running,
+        passes || `${num(c.dats)} dats and ${num(c.blobs)} blobs, ${num(c.resetDepots)} depots `
+                + `with a reset, ${num(c.incompleteDepots)} incomplete, `
+                + `${num(s.names.named)} named`],
+      ['size', c.sizesLoaded ? '~' + bytes(c.totalBytes) : '…', 'size', false,
+        c.sizesLoaded ? 'Total across every version of every depot, from the mirror listings.' : ''],
     ]);
 
     maybeRefreshNames(s.names.named);
   }
 
+  // The swarm is a mirror you can pick, but only while the engine that serves it is switched on —
+  // and that is a separate setting. Greying it out says so where the choice is made, rather than
+  // letting it be picked and quietly answered by HTTP.
   const sel = $('#mirrorSelect');
-  const want = s.mirrors.map((m) => m.id + (m.speedBps > 0 ? Math.round(m.speedBps) : '')).join('|');
+  const engineOff = s.settings && !s.settings.torrentEnabled;
+  const want = s.mirrors.map((m) => m.id + (m.speedBps > 0 ? Math.round(m.speedBps) : '')).join('|')
+             + (engineOff ? '|off' : '');
   if (sel.dataset.sig !== want) {
     sel.dataset.sig = want;
     sel.innerHTML = '';
     for (const m of s.mirrors) {
       const o = el('option');
       o.value = m.id;
-      const speed = m.speedBps > 0 ? ` — ${rate(m.speedBps)}` : m.reachable === false ? ' — unreachable' : '';
+      const dead = m.isTorrent && engineOff;
+      const speed = dead ? ' — engine off'
+        : m.speedBps > 0 ? ` — ${rate(m.speedBps)}`
+        : m.reachable === false ? ' — unreachable' : '';
       o.textContent = `${m.name} (${m.id})${speed}`;
       o.selected = m.active;
+      o.disabled = dead;
+      // Browsers are inconsistent about hovering a disabled option, so the reason is in the label
+      // as well as the tooltip.
+      if (dead) o.title = 'The BitTorrent engine is switched off in Settings, so the swarm cannot '
+                        + 'be used as a source. Turn it back on there to pick this.';
       sel.append(o);
     }
   }
@@ -229,6 +246,42 @@ function renderUpdate(u) {
 
 // Stat cells are built once and then only their text changes: rebuilding the row every poll
 // would restart the "naming in progress" animation twice a second and make it stutter.
+// Room left where downloads land. Kept current from the same poll as everything else, so a disk
+// filling up during a long download is visible while it happens rather than after it fails.
+function renderDisk(d) {
+  const box = $('.diskbox');
+  if (!box) return;
+
+  const root = $('#diskRoot');
+  const free = $('#diskFree');
+  const fill = $('#diskFill');
+  const text = $('#diskText');
+
+  if (!d || d.error || !d.total) {
+    box.classList.remove('low', 'full');
+    root.textContent = d?.root || '';
+    free.textContent = 'unknown';
+    fill.style.width = '0%';
+    text.textContent = d?.error
+      ? `Free space could not be read: ${d.error}. Downloads are not blocked by this.`
+      : '';
+    return;
+  }
+
+  const usedPct = Math.min(100, Math.max(0, (d.used / d.total) * 100));
+  const room = d.free - (d.headroom ?? 0);
+
+  root.textContent = d.root;
+  free.textContent = `${bytes(d.free)} free`;
+  fill.style.width = `${usedPct.toFixed(1)}%`;
+  text.textContent = `${bytes(d.used)} of ${bytes(d.total)} used  ·  `
+    + `${bytes(Math.max(0, room))} usable for downloads, `
+    + `with ${bytes(d.headroom ?? 0)} kept free`;
+
+  box.classList.toggle('full', room <= 0);
+  box.classList.toggle('low', room > 0 && usedPct >= 90);
+}
+
 function renderStats(cells) {
   const host = $('#stats');
 
@@ -242,13 +295,16 @@ function renderStats(cells) {
     }
   }
 
-  cells.forEach(([, value, label, busy], i) => {
+  cells.forEach(([, value, label, busy, title], i) => {
     const cell = host.children[i];
     const b = cell.firstChild;
     const span = cell.lastChild;
     if (b.textContent !== value) b.textContent = value;
     if (span.textContent !== label) span.textContent = label;
     cell.classList.toggle('busy', !!busy);
+    // The counts this block no longer shows are still worth having on hand.
+    const want = title ?? '';
+    if (cell.title !== want) cell.title = want;
   });
 }
 
@@ -500,7 +556,17 @@ function planPanel(s) {
   const webBtn = el('button', 'ghost', 'Download chain using browser');
   webBtn.title = 'Pick a folder; the chain is saved into blobs/ and dats/ inside it';
 
-  row.append(vLabel, vSel, crcLabel, crcSel, sizeInfo, planBtn, dlBtn, exBtn, webBtn);
+  // The optimiser leaves out the dats this version never reads, which is usually most of the
+  // chain. Someone archiving a depot wants those too, so it can be turned off per download.
+  const fullWrap = el('label', 'fullchain');
+  const fullBox = el('input');
+  fullBox.type = 'checkbox';
+  fullBox.id = 'planFullChain';
+  fullWrap.append(fullBox, el('span', null, 'All versions'));
+  fullWrap.title = 'Download every dat in the chain, including the ones this version does not read';
+  fullBox.onchange = () => updateSize();
+
+  row.append(vLabel, vSel, crcLabel, crcSel, fullWrap, sizeInfo, planBtn, dlBtn, exBtn, webBtn);
   body.append(row);
 
   const out = el('div');
@@ -521,6 +587,28 @@ function planPanel(s) {
     const choose = choices.length > 1;
     crcLabel.hidden = !choose;
     crcSel.hidden = !choose;
+  };
+
+  // A chain that does not fit fails part way through, after however many hours it took to get
+  // there, and leaves a disk with nothing left on it. The button says so beforehand instead.
+  //
+  // A drive that could not be measured counts as having room: the server refuses the download
+  // anyway if it turns out not to, and a reporting failure should not lock the app.
+  const applySpaceGuard = (need) => {
+    const d = state.disk;
+    if (!d || d.error || typeof d.free !== 'number') {
+      dlBtn.disabled = false;
+      dlBtn.title = '';
+      return;
+    }
+
+    const room = d.free - (d.headroom ?? 0);
+    dlBtn.disabled = need > room;
+    dlBtn.title = need > room
+      ? `Not enough free space on ${d.root} — ${bytes(need)} to download and `
+        + `${bytes(d.headroom ?? 0)} kept free, but only ${bytes(d.free)} is available. `
+        + `Free some space, or point the download directory at another drive in Settings.`
+      : '';
   };
 
   // Deltas mean a version costs everything below it too, so the figure is for the whole chain.
@@ -552,6 +640,7 @@ function planPanel(s) {
 
     sizeInfo.textContent = parts.join('  ·  ');
     sizeInfo.title = `chain v0…v${target}: ${bytes(total)} total`;
+    applySpaceGuard(left);
 
     refineSize(s.id, target);
   };
@@ -564,6 +653,10 @@ function planPanel(s) {
 
   async function refineSize(depot, target) {
     const mine = ++sizeToken;
+
+    // With the optimiser off the whole chain is fetched, so the first estimate is already the
+    // right one and refining it down would understate what the download is about to do.
+    if ($('#planFullChain')?.checked) return;
 
     let r;
     try { r = await api.get(`/api/depots/${depot}/needed?version=${target}`); }
@@ -605,6 +698,10 @@ function planPanel(s) {
     sizeInfo.title = skipped > 0
       ? `only versions ${r.needed.join(', ')} carry bytes v${target} reads`
       : `chain v0…v${target}: every dat is needed`;
+
+    // The refined figure is smaller than the first estimate, so a chain the guard had blocked can
+    // become one that fits.
+    applySpaceGuard(left);
   }
 
   const onVersion = () => { fillCrc(); updateSize(); };
@@ -624,7 +721,10 @@ async function doPlan(depot, version, blobCrc, download) {
   out.innerHTML = '<div class="muted">resolving chain…</div>';
 
   try {
-    const res = await api.post(download ? '/api/download' : '/api/plan', { depot, version, blobCrc: blobCrc || null });
+    const res = await api.post(download ? '/api/download' : '/api/plan', {
+      depot, version, blobCrc: blobCrc || null,
+      fullChain: !!$('#planFullChain')?.checked,
+    });
     const plan = res.plan ?? res;
     state.plan = plan;
     renderPlan(plan, out);
@@ -1516,6 +1616,8 @@ $('#openSettings').onclick = () => {
   $('#setExtractOut').value = s.extractOutDir ?? '';
   $('#setConcurrency').value = s.concurrency ?? 8;
   $('#setTorrentPort').value = s.torrentPort ?? 0;
+  $('#setUpKbps').value = s.torrentUploadKbps ?? 0;
+  $('#setDownKbps').value = s.torrentDownloadKbps ?? 0;
   $('#setPhased').checked = s.phasedDownloads !== false;
   $('#setBlobStreams').value = s.blobConcurrency ?? 32;
   $('#setDatStreams').value = s.datConcurrency ?? 2;
@@ -1523,6 +1625,7 @@ $('#openSettings').onclick = () => {
   $('#setBigFileMb').value = Math.round((s.bigFileBytes ?? 30000000) / 1_000_000);
   $('#setTorrent').checked = !!s.torrentEnabled;
   $('#setSeed').checked = !!s.seedDownloaded;
+  $('#setSwarm').checked = !!s.swarmAssist;
   $('#setVerify').checked = !!s.verifyHashes;
   $('#setFailover').checked = !!s.failover;
   $('#settingsDlg').showModal();
@@ -1531,7 +1634,10 @@ $('#saveSettings').onclick = async () => {
   // Sharing is its own endpoint because switching it has to start or stop the engine, not
   // just record a preference.
   try {
-    await api.post('/api/settings', { torrentEnabled: $('#setTorrent').checked });
+    await api.post('/api/settings', {
+      torrentEnabled: $('#setTorrent').checked,
+      swarmAssist: $('#setSwarm').checked,
+    });
     await api.post('/api/seed', { enabled: $('#setSeed').checked });
   } catch { }
   pollSeed();
@@ -1541,6 +1647,8 @@ $('#saveSettings').onclick = async () => {
     extractOutDir: $('#setExtractOut').value,
     concurrency: +$('#setConcurrency').value,
     torrentPort: +$('#setTorrentPort').value,
+    torrentUploadKbps: +$('#setUpKbps').value || 0,
+    torrentDownloadKbps: +$('#setDownKbps').value || 0,
     phasedDownloads: $('#setPhased').checked,
     blobConcurrency: +$('#setBlobStreams').value,
     datConcurrency: +$('#setDatStreams').value,
@@ -1896,6 +2004,51 @@ async function pollInstalls() {
 // header carries the state plainly rather than burying it in settings: whether anything is being
 // shared, to how many peers, and at what rate.
 
+// Said once, on the first start that has not seen it. Sharing spends the reader's upload and
+// begins on its own — including on everything downloaded before this version — so it is put in
+// front of them rather than left to be found in a bandwidth graph.
+//
+// There is deliberately no attempt to tell an update from a relaunch. The flag is written when the
+// dialog is dismissed, which makes the notice appear exactly once and never again; a relaunch of
+// the same version finds the flag already there.
+let sharingNoticeShown = false;
+
+function maybeTellAboutSharing() {
+  if (sharingNoticeShown) return;
+
+  const s = state.settings;
+  if (!s || s.sharingNoticeSeen !== false) return;
+  if (!s.torrentEnabled || !s.seedDownloaded) return;
+
+  const dlg = $('#shareDlg');
+  if (!dlg || dlg.open) return;
+
+  sharingNoticeShown = true;
+
+  // What is actually on offer right now, so the number is theirs rather than an abstraction.
+  const seed = state.seed;
+  const now = $('#shareDlgNow');
+  if (now) {
+    now.textContent = seed?.files
+      ? `Right now that is ${num(seed.files)} file(s), ${bytes(seed.bytes)}, already on your disk.`
+      : 'Nothing is being shared yet — it starts as soon as you have downloaded something.';
+  }
+
+  dlg.showModal();
+}
+
+$('#shareDlgOn').onclick = () => {
+  api.post('/api/settings', { sharingNoticeSeen: true }).catch(() => {});
+};
+
+$('#shareDlgOff').onclick = () => {
+  // Turning it off is the whole point of asking, so it has to actually take effect, not merely
+  // dismiss the box.
+  api.post('/api/seed', { enabled: false }).catch(() => {});
+  api.post('/api/settings', { sharingNoticeSeen: true }).catch(() => {});
+  setTimeout(pollSeed, 300);
+};
+
 async function pollSeed() {
   const box = $('#seedBox');
   const text = $('#seedText');
@@ -1925,8 +2078,15 @@ async function pollSeed() {
   }
 
   // starting / idle / error all have something worth saying.
-  text.textContent = d.state === 'starting' ? 'Preparing to share' : (d.message || d.state);
-  box.title = d.message || '';
+  //
+  // Starting is the slow one — reading the file list, linking what is already downloaded, then
+  // hashing those links — and on a full archive it runs for minutes. A single "Preparing to share"
+  // held for all of it looks indistinguishable from being stuck, so the stage is named instead.
+  text.textContent = d.message || (d.state === 'starting' ? 'Preparing to share' : d.state);
+  box.title = d.state === 'starting'
+    ? 'Starting up: the file list is read, everything already downloaded is linked into the '
+      + 'share, and those links are checked before anything is offered.'
+    : (d.message || '');
 }
 
 $('#seedBox').onclick = () => $('#openSettings').click();

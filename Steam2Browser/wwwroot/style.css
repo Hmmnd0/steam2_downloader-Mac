@@ -519,6 +519,22 @@ dialog menu { display: flex; justify-content: flex-end; gap: 8px; margin: 0; pad
    numbers rather than in a depot panel. */
 .statbtn { font-size: 11px; padding: 5px 9px; white-space: nowrap; align-self: center; }
 
+/* Free space on the drive downloads land on. Fill is what is used, so a nearly full bar reads the
+   way a nearly full disk should. */
+.diskbox { display: flex; flex-direction: column; gap: 6px; margin: -4px 0 4px; }
+.diskbox .diskhead {
+  display: flex; justify-content: space-between; align-items: baseline;
+  font-size: 11px; color: var(--dim);
+}
+.diskbox .diskhead b { color: #fff; font-variant-numeric: tabular-nums; }
+.diskbox .bar { height: 6px; }
+.diskbox .bar i { width: 0; transition: width .3s ease; }
+/* Below a couple of downloads' worth of room, the bar stops being decoration. */
+.diskbox.low .bar i { background: linear-gradient(to bottom, #e8a33d 0%, #a86c1a 100%); }
+.diskbox.low .diskhead b { color: var(--warn); }
+.diskbox.full .bar i { background: linear-gradient(to bottom, #d94126 0%, #8c2716 100%); }
+.diskbox.full .diskhead b { color: var(--bad, #d94126); }
+
 .rangeprog { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
 .rangeprog .bar { height: 5px; border-radius: 3px; background: var(--line); overflow: hidden; }
 .rangeprog .bar i { display: block; height: 100%; width: 0; background: var(--accent);
@@ -597,8 +613,20 @@ dialog menu { display: flex; justify-content: flex-end; gap: 8px; margin: 0; pad
   background: var(--bg-2); color: var(--dim);
   border: 1px solid var(--line-2); border-radius: var(--radius); cursor: pointer;
 }
+/* The label carries engine startup stages now. The longest of them — "checking 116,339 file(s)
+   before sharing them" — fits, and anything beyond it is clipped rather than allowed to push the
+   rest of the header around. The full text is in the tooltip either way. */
+.seed span { overflow: hidden; text-overflow: ellipsis; max-width: 44ch; }
 .seed:hover { color: #fff; border-color: var(--accent); }
 .seed i { width: 7px; height: 7px; border-radius: 50%; background: var(--dimmer); flex: none; }
 .seed.on { color: #fff; }
 .seed.on i { background: var(--good); box-shadow: 0 0 6px var(--good); }
 .seed.warn i { background: var(--warn); }
+
+/* Sits with the version it applies to, quiet enough not to read as a primary control. */
+.fullchain {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 11px; color: var(--dim); white-space: nowrap; cursor: pointer;
+}
+.fullchain:hover { color: #fff; }
+.fullchain input { margin: 0; }

@@ -259,14 +259,22 @@ app.MapGet("/api/state", () => new
         settings.BigFileBytes,
         settings.TorrentEnabled,
         settings.SeedDownloaded,
+        settings.SwarmAssist,
+        settings.SharingNoticeSeen,
         settings.VerifyHashes,
         settings.TorrentPort,
+        settings.TorrentUploadKbps,
+        settings.TorrentDownloadKbps,
         settings.ExtractOutDir,
         trackers = settings.TrackersToUse,
     },
+    // Free space where downloads land. Nothing is asked of it here, so needed is zero — this is
+    // the standing figure the settings dialog shows, not a verdict on any one download.
+    disk = Dto.Space(settings.DataDir, 0),
     mirrors = Mirrors.All.Select(m => new
     {
         m.Id, m.Name, m.Region, m.BaseUrl, m.SpeedBps, m.TtfbMs, m.Reachable, m.Error,
+        m.IsTorrent,
         tested = m.TestedUtc,
         active = m.Id == client.Primary.Id,
     }),
@@ -357,6 +365,9 @@ app.MapPost("/api/settings", async (SettingsPatch patch) =>
     if (patch.BlobConcurrency is { } bc) settings.BlobConcurrency = Math.Clamp(bc, 1, 128);
     if (patch.DatConcurrency is { } dc) settings.DatConcurrency = Math.Clamp(dc, 1, 64);
     if (patch.WarmupLookahead is { } wl) settings.WarmupLookahead = Math.Clamp(wl, 0, 16);
+    if (patch.SwarmAssist is { } sa) settings.SwarmAssist = sa;
+    if (patch.SharingNoticeSeen is { } sn) settings.SharingNoticeSeen = sn;
+
     if (patch.TorrentEnabled is { } te)
     {
         settings.TorrentEnabled = te;
@@ -382,10 +393,27 @@ app.MapPost("/api/settings", async (SettingsPatch patch) =>
         resetTorrent = port != settings.TorrentPort;
         settings.TorrentPort = port;
     }
+
+    // Unlike the port, a speed cap does not need the engine rebuilt — it is pushed into the running
+    // one, so a limit set while an upload is in the way takes effect on that upload.
+    var rateChanged = false;
+    if (patch.TorrentUploadKbps is { } uk)
+    {
+        int v = Math.Max(0, uk);
+        rateChanged |= v != settings.TorrentUploadKbps;
+        settings.TorrentUploadKbps = v;
+    }
+    if (patch.TorrentDownloadKbps is { } dk)
+    {
+        int v = Math.Max(0, dk);
+        rateChanged |= v != settings.TorrentDownloadKbps;
+        settings.TorrentDownloadKbps = v;
+    }
     if (!string.IsNullOrWhiteSpace(patch.DataDir)) settings.DataDir = patch.DataDir!;
     if (!string.IsNullOrWhiteSpace(patch.ExtractOutDir)) settings.ExtractOutDir = patch.ExtractOutDir!;
     if (patch.ExtraTrackers is { } tr) settings.ExtraTrackers = tr;
     settings.Save();
+    if (rateChanged && !resetTorrent) await torrent.ApplyRateLimitsAsync();
     if (resetTorrent) await torrent.ResetAsync();
     return Results.Ok(new { ok = true });
 });
@@ -911,7 +939,8 @@ app.MapPost("/api/plan", async (PlanRequest req, CancellationToken ct) =>
     if (cat is null) return Results.BadRequest(new { error = "index not loaded yet" });
 
     var plan = await ChainResolver.ResolveAsync(cat, client, settings.DataDir, req.Depot, req.Version, req.BlobCrc, ct);
-    changes.Prune(plan);
+    plan.FullChain = req.FullChain is true;
+    if (!plan.FullChain) changes.Prune(plan);
     return Results.Ok(Dto.Plan(plan, settings));
 });
 
@@ -921,8 +950,19 @@ app.MapPost("/api/download", async (PlanRequest req, CancellationToken ct) =>
     if (cat is null) return Results.BadRequest(new { error = "index not loaded yet" });
 
     var plan = await ChainResolver.ResolveAsync(cat, client, settings.DataDir, req.Depot, req.Version, req.BlobCrc, ct);
-    changes.Prune(plan);
+    plan.FullChain = req.FullChain is true;
+    if (!plan.FullChain) changes.Prune(plan);
     if (plan.Error is not null || plan.NeedsChoice) return Results.Ok(Dto.Plan(plan, settings));
+
+    // Checked here and not only in the browser. The button that leads here is disabled when the
+    // plan does not fit, but a disabled button is a courtesy, not a guarantee — this endpoint is
+    // also reached by a stale page, a second window, and anything replaying a request — and the
+    // failure it prevents is a full disk part-way through a download that has to start over.
+    if (!Disk.Fits(settings.DataDir, Dto.RemainingBytes(plan, settings), out var space))
+    {
+        plan.Error = Dto.NotEnoughSpace(plan, settings, space);
+        return Results.Ok(Dto.Plan(plan, settings));
+    }
 
     var job = downloads.Start(plan);
     return Results.Ok(new { jobId = job.Id, plan = Dto.Plan(plan, settings) });
@@ -1092,11 +1132,12 @@ static void OpenWithDefaultApplication(string target)
 }
 
 internal sealed record SettingsPatch(
-    string? MirrorId, bool? Failover, int? Concurrency, bool? VerifyHashes, bool? PhasedDownloads, bool? TorrentEnabled, int? BlobConcurrency, int? DatConcurrency, int? WarmupLookahead, int? BigFileMb,
-    int? TorrentPort, string? DataDir, string? ExtractOutDir, string[]? ExtraTrackers);
+    string? MirrorId, bool? Failover, int? Concurrency, bool? VerifyHashes, bool? PhasedDownloads, bool? TorrentEnabled, bool? SwarmAssist, bool? SharingNoticeSeen, int? BlobConcurrency, int? DatConcurrency, int? WarmupLookahead, int? BigFileMb,
+    int? TorrentPort, int? TorrentUploadKbps, int? TorrentDownloadKbps,
+    string? DataDir, string? ExtractOutDir, string[]? ExtraTrackers);
 
 internal sealed record ReloadRequest(bool Refresh, bool Sizes);
-internal sealed record PlanRequest(int Depot, int Version, string? BlobCrc);
+internal sealed record PlanRequest(int Depot, int Version, string? BlobCrc, bool? FullChain);
 internal sealed record BlobRangeRequest(int From, int To);
 internal sealed record InstallRequest(int Appid, string Build, List<int>? Depots);
 internal sealed record SeedRequest(bool Enabled);
@@ -1105,6 +1146,46 @@ internal sealed record RevealRequest(string Path);
 
 internal static class Dto
 {
+    /// <summary>
+    /// Bytes a plan still has to fetch. Files already on disk are not downloaded again, so they are
+    /// not counted against the free space either.
+    /// </summary>
+    public static long RemainingBytes(ChainPlan p, Settings s) => p.Files
+        .Where(f => !System.IO.File.Exists(Path.Combine(s.DataDir, f.Entry.DirName, f.Entry.FileName)))
+        .Sum(f => f.Size);
+
+    /// <summary>
+    /// Free space where downloads land, and whether <paramref name="needed"/> bytes fit in it.
+    /// </summary>
+    public static object Space(string dir, long needed)
+    {
+        var d = Disk.For(dir);
+        return new
+        {
+            root = d.Root,
+            free = d.FreeBytes,
+            total = d.TotalBytes,
+            used = d.UsedBytes,
+            headroom = Disk.Headroom,
+            error = d.Error,
+            // Null when the drive could not be measured, which the UI shows as "unknown" rather
+            // than blocking on a number it does not have.
+            fits = d.Error is not null ? (bool?)null : d.FreeBytes >= needed + Disk.Headroom,
+            needed,
+        };
+    }
+
+    public static string NotEnoughSpace(ChainPlan p, Settings s, DiskSpace space)
+    {
+        long needed = RemainingBytes(p, s);
+        return $"not enough free space on {space.Root}: {Fmt(needed)} to download plus "
+             + $"{Fmt(Disk.Headroom)} kept free, but {Fmt(space.FreeBytes)} is available";
+    }
+
+    private static string Fmt(long b) => b >= 1_000_000_000L
+        ? $"{b / 1_000_000_000d:0.##} GB"
+        : $"{b / 1_000_000d:0.##} MB";
+
     public static object Summary(Depot d, NameRecord? name = null, string? display = null, string? source = null) => new
     {
         id = d.Id,
@@ -1164,11 +1245,16 @@ internal static class Dto
         blobCount = p.Files.Count(f => f.Entry.Kind == Kind.Blob),
         alreadyLocal = p.Files.Count(f =>
             System.IO.File.Exists(Path.Combine(s.DataDir, f.Entry.DirName, f.Entry.FileName))),
+        remainingBytes = RemainingBytes(p, s),
+        // Everything the button needs to explain itself: how much room there is, and whether this
+        // particular download fits in it.
+        disk = Space(s.DataDir, RemainingBytes(p, s)),
         extractArgs = p.ExtractArgs,
         // Null when it could not be worked out yet, which the UI reports rather than hiding.
         skippedDats = p.SkippedDats,
         skippedBytes = p.SkippedBytes,
         chainDats = p.ChainDats,
+        fullChain = p.FullChain,
         files = p.Files.Take(2000).Select(f => new
         {
             name = f.Entry.FileName,

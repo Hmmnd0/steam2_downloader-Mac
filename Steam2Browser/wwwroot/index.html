@@ -151,6 +151,17 @@
       <input id="setDataDir" type="text">
     </label>
 
+    <!-- Depots run to tens of gigabytes, so the room left on the drive they land on belongs here,
+         next to the box that chooses it. -->
+    <div class="diskbox">
+      <div class="diskhead">
+        <span id="diskRoot">—</span>
+        <b id="diskFree"></b>
+      </div>
+      <div class="bar"><i id="diskFill"></i></div>
+      <span class="hint" id="diskText"></span>
+    </div>
+
     <label>Extract output directory
       <input id="setExtractOut" type="text">
     </label>
@@ -164,6 +175,19 @@
       <span class="hint">0 chooses a random port; set your VPN forwarded port here</span>
       <input id="setTorrentPort" type="number" min="0" max="65535">
     </label>
+
+    <div class="dlgrow">
+      <label style="flex:1">Torrent upload limit, KB/s
+        <span class="hint">0 is no limit</span>
+        <input id="setUpKbps" type="number" min="0" max="1000000">
+      </label>
+      <label style="flex:1">Torrent download limit, KB/s
+        <span class="hint">0 is no limit</span>
+        <input id="setDownKbps" type="number" min="0" max="1000000">
+      </label>
+    </div>
+    <span class="hint">Both apply to the torrent engine only — downloads from the HTTP mirrors are
+      not capped by these. A limit takes effect immediately, without a restart.</span>
 
     <label class="row">
       <input id="setPhased" type="checkbox">
@@ -190,16 +214,25 @@
     <label class="row">
       <input id="setTorrent" type="checkbox">
       <span>Enable the BitTorrent engine
-        <span class="hint">off by default: loading the 13 TB file list leaves the engine stuck
-        before it ever starts, and the cause is not yet understood. The HTTP mirrors do not need
-        it. Sharing below requires this.</span></span>
+        <span class="hint">needed for both of the options below. Turning it off stops sharing and
+        the swarm helper; the HTTP mirrors keep working either way.</span></span>
     </label>
 
     <label class="row">
       <input id="setSeed" type="checkbox">
       <span>Share downloaded files back to the swarm
         <span class="hint">the archive survives because people seed it, and it has very few
-        seeders — this uploads only files you already have and never downloads anything</span></span>
+        seeders. Everything you have already downloaded is offered, and anything you download
+        later joins it straight away. Uploads only — nothing is ever fetched for this.</span></span>
+    </label>
+
+    <label class="row">
+      <input id="setSwarm" type="checkbox">
+      <span>Let the swarm help with downloads
+        <span class="hint">the mirror takes the file list from the front and the swarm from the
+        back, so they meet in the middle. Every file the swarm supplies is one the mirrors are not
+        asked for. It never holds a download up: whatever it has not finished, the mirror
+        fetches.</span></span>
     </label>
 
     <label class="row">
@@ -231,6 +264,33 @@
     <menu>
       <button value="cancel" class="ghost">Close</button>
       <button id="saveSettings" value="save" class="primary">Save</button>
+    </menu>
+  </form>
+</dialog>
+
+<!--
+  Shown once, on the first start that has not seen it. Sharing spends the reader's upload and
+  starts on its own, including on everything they downloaded before this version, so it is said
+  plainly rather than left to be discovered in a bandwidth graph.
+-->
+<dialog id="shareDlg">
+  <form method="dialog">
+    <h2>Sharing is on</h2>
+
+    <p>This app now shares the depots you have downloaded back to the swarm, and takes part of new
+       downloads from it.</p>
+
+    <p class="hint">The archive is 13 TB kept alive by a handful of people seeding it, and three
+       HTTP mirrors paid for by one person who has asked everyone to pull less from them. Every
+       file you share is one those servers are not asked for. Only files you already have are
+       offered — nothing extra is downloaded to share, and your download speed is never held up
+       by it.</p>
+
+    <p class="hint" id="shareDlgNow"></p>
+
+    <menu>
+      <button id="shareDlgOff" value="off" class="ghost">Not now</button>
+      <button id="shareDlgOn" value="ok" class="primary">Keep sharing</button>
     </menu>
   </form>
 </dialog>

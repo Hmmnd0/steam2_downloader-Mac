@@ -50,12 +50,11 @@ public sealed class Settings
     /// Master switch for everything BitTorrent: downloading from the swarm, sharing back to it, and
     /// the engine itself.
     ///
-    /// Off by default. Loading the metadata from steam2.torrent gets as far as reading all 116 346
-    /// files and then leaves the manager at "Stopped" — the cause is not yet understood, and an
-    /// engine that half-starts is not something to leave running in the background of everyone's
-    /// downloads. Nothing else in the app depends on it: the HTTP mirrors do the work.
+    /// On. It was off while starting the engine meant setting 116 346 file priorities one at a
+    /// time — 8.5 minutes during which it looked hung — and that is now done with a piece picker
+    /// instead, in hundredths of a second.
     /// </summary>
-    public bool TorrentEnabled { get; set; }
+    public bool TorrentEnabled { get; set; } = true;
 
     /// <summary>
     /// Share what has already been downloaded back to the swarm. Requires
@@ -68,6 +67,36 @@ public sealed class Settings
     public bool SeedDownloaded { get; set; } = true;
 
     /// <summary>
+    /// Let the swarm fetch the tail of a download while the mirror works the front.
+    ///
+    /// On. Every file it supplies is one the mirrors are not asked for, and they are three servers
+    /// run by one person who has asked people to take less. It can only help: the mirror never
+    /// waits for it, and a file the swarm is too slow to finish is simply fetched over HTTP.
+    /// </summary>
+    public bool SwarmAssist { get; set; } = true;
+
+    /// <summary>
+    /// Whether the reader has been told that sharing is on.
+    ///
+    /// Sharing spends their upload, and it starts by itself — including on everything they had
+    /// already downloaded before this version. That deserves to be said once, plainly, rather than
+    /// left for them to discover in a bandwidth graph.
+    ///
+    /// This deliberately does not try to tell an upgrade from a fresh install, because it does not
+    /// need to: the flag is written when the notice is dismissed, so the notice appears on the
+    /// first start that lacks it and never again. Relaunching the same version does not bring it
+    /// back. Someone who deletes steam2info sees it once more, which is correct — that is a new
+    /// installation as far as anything here can tell.
+    /// </summary>
+    public bool SharingNoticeSeen { get; set; }
+
+    /// <summary>
+    /// Marks that the one-time move above has run, so a user who switches the engine off after it
+    /// keeps it off. Without this the setting would be forced back on at every start.
+    /// </summary>
+    public bool? TorrentSwitchSeen { get; set; }
+
+    /// <summary>
     /// Byte length of the last successful dats/ and blobs/ listing fetch, so the next one can show
     /// a real percentage. nginx builds these listings on the fly and sends them chunked with no
     /// Content-Length, so the size of the previous fetch is the only total available. The seeded
@@ -78,6 +107,20 @@ public sealed class Settings
     public long BlobListingBytes { get; set; } = 21_000_000L;
     public bool VerifyHashes { get; set; } = true;
     public int TorrentPort { get; set; }
+
+    /// <summary>
+    /// Caps on what the torrent engine may send and receive, in kilobytes per second. Zero is no
+    /// cap, which is the default: the archive needs seeders far more than the average connection
+    /// needs protecting, so a limit is something to reach for rather than something to start with.
+    ///
+    /// These bound the torrent engine alone. Downloads from the HTTP mirrors are not affected, and
+    /// nor are they meant to be — the mirrors are the part that already answers to whoever pays for
+    /// them, while uploading is what runs unattended in the background and can quietly saturate a
+    /// line for hours.
+    /// </summary>
+    public int TorrentUploadKbps { get; set; }
+
+    public int TorrentDownloadKbps { get; set; }
 
     public string ExtractOutDir { get; set; } = "";
 
@@ -249,7 +292,24 @@ public sealed class Settings
         // keeps 2; the point is to rescue the settings nobody chose, not to overrule a choice.
         if (s.DatConcurrency == 2) s.DatConcurrency = 8;
         if (s.BigFileBytes is 30_000_000L or 31_457_280L) s.BigFileBytes = 0L;
+        // Everyone who ran the build that introduced this switch has "false" written in their
+        // settings, because the engine was disabled for everyone while it was unusable. Nobody
+        // could have formed a preference against a feature that never worked, so that stored value
+        // is a leftover rather than a choice, and it is moved once.
+        if (s.TorrentSwitchSeen is not true)
+        {
+            s.TorrentEnabled = true;
+            s.TorrentSwitchSeen = true;
+        }
+
         if (s.TorrentPort is < 0 or > 65535) s.TorrentPort = 0;
+
+        // A negative cap is not a slower engine, it is a stopped one — MonoTorrent reads any
+        // non-zero value as a limit. Anything below zero becomes "no limit" rather than a silent
+        // standstill nobody would connect to a number they typed in a settings box.
+        if (s.TorrentUploadKbps < 0) s.TorrentUploadKbps = 0;
+        if (s.TorrentDownloadKbps < 0) s.TorrentDownloadKbps = 0;
+
         return s;
     }
 

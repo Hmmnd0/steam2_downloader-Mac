@@ -32,6 +32,15 @@ public sealed class ChainPlan
 
     /// <summary>Dats in the chain before any were skipped, so the UI can say "2 of 57".</summary>
     public int ChainDats;
+
+    /// <summary>
+    /// Fetch the whole chain, skipping nothing.
+    ///
+    /// The optimiser works out which dats the target version actually reads and leaves the rest
+    /// alone, which is usually most of them. Someone archiving a depot wants the ones it discards
+    /// too — they are the depot's history, not waste — so this turns it off for that download.
+    /// </summary>
+    public bool FullChain;
 }
 
 public static class ChainResolver

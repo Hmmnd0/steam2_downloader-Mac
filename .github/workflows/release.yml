@@ -43,7 +43,7 @@ jobs:
             "SNAPSHOT=no" | Out-File -Append $env:GITHUB_ENV
           }
 
-      - name: Publish
+      - name: Publish Windows
         shell: pwsh
         run: |
           dotnet publish Steam2Browser/Steam2Browser.csproj `
@@ -53,16 +53,30 @@ jobs:
             -p:EnableCompressionInSingleFile=true `
             -p:PublishTrimmed=false `
             -p:DebugType=none `
-            -o publish
+            -o publish/win-x64
+
+      - name: Publish Linux
+        shell: pwsh
+        run: |
+          dotnet publish Steam2Browser/Steam2Browser.csproj `
+            -c Release -r linux-x64 --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:EnableCompressionInSingleFile=true `
+            -p:PublishTrimmed=false `
+            -p:DebugType=none `
+            -o publish/linux-x64
 
       - name: Trim publish leftovers
         shell: pwsh
         # The UI and the depot key table are embedded in the exe, so the loose copies
         # ASP.NET emits are dead weight. web.config only matters under IIS.
         run: |
-          Remove-Item -Recurse -Force publish/wwwroot -ErrorAction SilentlyContinue
-          Remove-Item -Force publish/web.config -ErrorAction SilentlyContinue
-          Remove-Item -Force publish/*.staticwebassets.endpoints.json -ErrorAction SilentlyContinue
+          foreach ($rid in 'win-x64', 'linux-x64') {
+            Remove-Item -Recurse -Force "publish/$rid/wwwroot" -ErrorAction SilentlyContinue
+            Remove-Item -Force "publish/$rid/web.config" -ErrorAction SilentlyContinue
+            Remove-Item -Force "publish/$rid/*.staticwebassets.endpoints.json" -ErrorAction SilentlyContinue
+          }
           Get-ChildItem publish
 
       - name: Smoke test
@@ -71,7 +85,7 @@ jobs:
         # would otherwise only show up on a user's machine. The checks are structural on purpose:
         # an earlier version matched the window title and broke the moment the app was renamed.
         run: |
-          $exe = Start-Process -FilePath publish/steam2browser.exe `
+          $exe = Start-Process -FilePath publish/win-x64/steam2browser.exe `
             -ArgumentList '--no-browser','--port=5099' -PassThru
 
           $page = $null
@@ -113,14 +127,18 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          Copy-Item README.md publish/
-          Compress-Archive -Path publish/* -DestinationPath steam2browser-win-x64.zip -Force
-          Get-Item steam2browser-win-x64.zip | Select-Object Name, Length
+          Copy-Item README.md publish/win-x64/
+          Copy-Item README.md publish/linux-x64/
+          Compress-Archive -Path publish/win-x64/* -DestinationPath steam2browser-win-x64.zip -Force
+          Compress-Archive -Path publish/linux-x64/* -DestinationPath steam2browser-linux-x64.zip -Force
+          Get-Item steam2browser-win-x64.zip, steam2browser-linux-x64.zip | Select-Object Name, Length
 
       - uses: actions/upload-artifact@v4
         with:
-          name: steam2browser-win-x64
-          path: steam2browser-win-x64.zip
+          name: steam2browser-packages
+          path: |
+            steam2browser-win-x64.zip
+            steam2browser-linux-x64.zip
 
       - name: Release
         shell: pwsh
@@ -134,11 +152,12 @@ jobs:
           $notes = @"
           Built from commit $sha.
 
-          Download ``steam2browser-win-x64.zip``, unzip, run ``steam2browser.exe``.
-          Self-contained: no .NET install needed. Everything it writes goes to ``steam2info/``
-          next to the executable.
+          Windows: download ``steam2browser-win-x64.zip``, unzip, and run ``steam2browser.exe``.
+          Linux: download ``steam2browser-linux-x64.zip``, unzip, run ``chmod +x steam2browser``
+          once, then run ``./steam2browser``. Both are self-contained; no .NET install is needed.
+          Everything the app writes goes to ``steam2info/`` next to the executable.
           "@
-          gh release create $tag steam2browser-win-x64.zip `
+          gh release create $tag steam2browser-win-x64.zip steam2browser-linux-x64.zip `
             --title $tag `
             --notes $notes `
             --target ${{ github.sha }}

@@ -182,7 +182,7 @@ if (!PortIsFree(port))
 
         if (!noBrowser)
         {
-            try { Process.Start(new ProcessStartInfo(running) { UseShellExecute = true }); }
+            try { OpenWithDefaultApplication(running); }
             catch { /* the URL is printed above */ }
         }
         return 0;
@@ -976,7 +976,7 @@ app.MapPost("/api/reveal", (RevealRequest req) =>
         string target = req.Path;
         if (string.IsNullOrWhiteSpace(target)) return Results.BadRequest(new { error = "empty path" });
         if (!Directory.Exists(target) && !File.Exists(target)) Directory.CreateDirectory(target);
-        Process.Start(new ProcessStartInfo("explorer.exe", $"\"{target}\"") { UseShellExecute = true });
+        OpenWithDefaultApplication(target);
         return Results.Ok(new { ok = true });
     }
     catch (Exception ex)
@@ -1048,7 +1048,7 @@ Console.WriteLine("press Ctrl+C to stop");
 
 if (!noBrowser)
 {
-    try { Process.Start(new ProcessStartInfo(url) { UseShellExecute = true }); }
+    try { OpenWithDefaultApplication(url); }
     catch { /* headless is fine, the URL is printed above */ }
 }
 
@@ -1067,6 +1067,29 @@ catch (IOException ex)
 return 0;
 
 // ---------------- request bodies ----------------
+
+static void OpenWithDefaultApplication(string target)
+{
+    if (OperatingSystem.IsLinux())
+    {
+        var startInfo = new ProcessStartInfo("xdg-open") { UseShellExecute = false };
+        startInfo.ArgumentList.Add(target);
+        Process.Start(startInfo);
+        return;
+    }
+
+    if (OperatingSystem.IsMacOS())
+    {
+        var startInfo = new ProcessStartInfo("open") { UseShellExecute = false };
+        startInfo.ArgumentList.Add(target);
+        Process.Start(startInfo);
+        return;
+    }
+
+    // Shell execution lets Windows select Explorer for directories and the default browser
+    // for URLs without hard-coding a Windows executable into the rest of the application.
+    Process.Start(new ProcessStartInfo(target) { UseShellExecute = true });
+}
 
 internal sealed record SettingsPatch(
     string? MirrorId, bool? Failover, int? Concurrency, bool? VerifyHashes, bool? PhasedDownloads, bool? TorrentEnabled, int? BlobConcurrency, int? DatConcurrency, int? WarmupLookahead, int? BigFileMb,

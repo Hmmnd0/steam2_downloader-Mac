@@ -379,7 +379,9 @@ td.mono { font-family: var(--mono); font-size: 11px; color: var(--dim); }
 .vitem[open] > summary { background: #22354a; color: #fff; }
 
 .vitem .vver { color: #fff; font-weight: 400; min-width: 46px; font-variant-numeric: tabular-nums; }
-.vitem .vdate { color: var(--dim); font-variant-numeric: tabular-nums; min-width: 84px; }
+/* Wider than the old numeric-only format needed: a spelled month is longer in every locale. */
+.vitem .vdate { color: var(--dim); font-variant-numeric: tabular-nums; min-width: 118px;
+                white-space: nowrap; }
 .vitem .vwhat { color: var(--accent); flex: 1; }
 .vitem .vwhat.dim { color: var(--dimmer); }
 .vitem .vwhat.bad { color: var(--bad); }

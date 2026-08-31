@@ -47,7 +47,13 @@ function fmtDate(value) {
   if (!m) return String(value);
 
   const d = new Date(+m[1], +m[2] - 1, +m[3]);
-  return Number.isNaN(d.getTime()) ? String(value) : d.toLocaleDateString();
+  if (Number.isNaN(d.getTime())) return String(value);
+
+  // The month is spelled, not numbered. A purely numeric locale format is ambiguous — 01.02.2011
+  // is January in the United States and February in Britain, and nothing in the string says which
+  // — and year-first locales such as Korean and Hungarian render 2011. 12. 27., which readers of
+  // other locales take for a mistake. A named month cannot be misread in any of them.
+  return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
 }
 const rate = (bps) => (!bps || bps <= 0 ? '—' : bytes(bps) + '/s');
 // Size change, with the sign kept: a diff is only readable if growth and shrinkage look different.

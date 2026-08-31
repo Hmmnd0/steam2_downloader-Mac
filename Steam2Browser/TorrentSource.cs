@@ -40,8 +40,8 @@ public sealed class TorrentStatus
 /// The archive as a BitTorrent swarm, used as a fourth source alongside the three HTTP mirrors.
 ///
 /// The torrent holds all 116 339 files — 13.32 TB, matching the archive exactly — so it is only
-/// usable because BitTorrent can fetch selected files: everything is set to DoNotDownload and only
-/// the files a chain actually needs are raised in priority.
+/// usable because BitTorrent can fetch selected files: the piece picker is handed the files a chain
+/// actually needs and never asks the swarm for anything else.
 ///
 /// Metadata is fetched from the swarm once (the magnet carries no file list) and cached on disk,
 /// so later runs skip that wait.
@@ -80,7 +80,24 @@ public sealed class TorrentSource(Settings settings)
 
     private TorrentManager? _seedManager;
 
-    public bool Ready => _manager is { HasMetadata: true };
+    /// <summary>
+    /// What keeps the download to the files a chain asked for. It replaces the engine's own picker
+    /// on the downloading manager and is the only thing standing between a start and all 13.32 TB,
+    /// so it goes on before the manager is ever started.
+    /// </summary>
+    private SelectionPieceRequester? _requester;
+
+    /// <summary>
+    /// The files the running download selected, kept for the progress readings: the manager's own
+    /// PartialProgress counts everything above DoNotDownload, which is now every file.
+    /// </summary>
+    private IReadOnlyList<ITorrentManagerFile> _selection = Array.Empty<ITorrentManagerFile>();
+
+    /// <summary>
+    /// Ready means the file list is known and the selection picker is on: without the picker a
+    /// download would select files the manager knows nothing about and start on all 13.32 TB.
+    /// </summary>
+    public bool Ready => _manager is { HasMetadata: true } && _requester is not null;
 
     // ---------------- startup ----------------
 
@@ -307,6 +324,11 @@ public sealed class TorrentSource(Settings settings)
                     var loaded = await Torrent.LoadAsync(torrentPath);
                     _manager = await _engine.AddAsync(loaded, dataDir, torrentSettings);
                     Status.Message = $"file list read from {Path.GetFileName(torrentPath)}";
+
+                    // The file list came with the file, so the picker can be in place before the
+                    // manager has ever run and there is no window in which it could ask for
+                    // anything. The magnet path has to wait for metadata to know the files at all.
+                    await AttachRequesterAsync();
                 }
                 else
                 {
@@ -365,7 +387,10 @@ public sealed class TorrentSource(Settings settings)
             await _manager.StopAsync(TimeSpan.FromSeconds(10));
 
             MapFiles();
-            await DeselectAllAsync();
+
+            // Only reached without a picker on the magnet path, where the file list did not exist
+            // until now.
+            if (_requester is null) await AttachRequesterAsync();
 
             Status.HasMetadata = true;
             Status.State = "ready";
@@ -448,8 +473,8 @@ public sealed class TorrentSource(Settings settings)
     }
 
     /// <summary>
-    /// Indexes the torrent by archive-relative path and parks every file at DoNotDownload, so
-    /// nothing is fetched until a chain asks for it.
+    /// Indexes the torrent by archive-relative path, which is how a chain names the files it is
+    /// after.
     /// </summary>
     private void MapFiles()
     {
@@ -474,13 +499,14 @@ public sealed class TorrentSource(Settings settings)
         Status.TotalFiles = _byArchivePath.Count;
     }
 
-    /// <summary>Parks everything, so a new selection starts from a clean slate.</summary>
-    private async Task DeselectAllAsync()
+    /// <summary>
+    /// Hands the manager the selection picker, selecting nothing. Can only be done once the file
+    /// list is known and while the manager is stopped, which MonoTorrent enforces.
+    /// </summary>
+    private async Task AttachRequesterAsync()
     {
-        var manager = _manager!;
-        foreach (var file in manager.Files)
-            if (file.Priority != Priority.DoNotDownload)
-                await manager.SetFilePriorityAsync(file, Priority.DoNotDownload);
+        _requester = new SelectionPieceRequester(_manager!.Files);
+        await _manager.ChangePickerAsync(_requester);
     }
 
     // ---------------- downloading ----------------
@@ -498,28 +524,25 @@ public sealed class TorrentSource(Settings settings)
             throw new InvalidOperationException(Status.Error ?? "the torrent source is not available");
 
         var manager = _manager!;
+        var requester = _requester!;
         var missing = new List<Entry>();
         var selected = new List<(Entry Entry, ITorrentManagerFile File)>();
-
-        await DeselectAllAsync();
 
         foreach (var entry in wanted)
         {
             if (_byArchivePath.TryGetValue(entry.RelPath, out var file))
-            {
-                await manager.SetFilePriorityAsync(file, Priority.High);
                 selected.Add((entry, file));
-            }
             else
-            {
                 missing.Add(entry);
-            }
         }
 
         Status.SelectedFiles = selected.Count;
         Status.SelectedBytes = selected.Sum(x => x.File.Length);
 
         if (selected.Count == 0) return missing;
+
+        _selection = selected.Select(x => x.File).ToList();
+        requester.Select(_selection);
 
         Status.State = "downloading";
         Status.Message = $"{selected.Count} files selected from the swarm";
@@ -528,13 +551,13 @@ public sealed class TorrentSource(Settings settings)
         {
             await manager.StartAsync();
 
-            // PartialProgress covers only the files above DoNotDownload, which is the selection.
-            while (manager.PartialProgress < 100)
+            // Every piece of every selected file, which is all the picker will ever ask for.
+            while (!SelectionComplete())
             {
                 ct.ThrowIfCancellationRequested();
                 Sample();
 
-                long done = (long)(Status.SelectedBytes * manager.PartialProgress / 100.0);
+                long done = (long)(Status.SelectedBytes * Status.SelectedProgress / 100.0);
                 onProgress?.Invoke(done, Status.SelectedBytes, manager.Monitor.DownloadRate);
 
                 await Task.Delay(1000, ct);
@@ -547,7 +570,8 @@ public sealed class TorrentSource(Settings settings)
         {
             // Stop as soon as the selection is in; leaving it running would start on everything else.
             await manager.StopAsync(TimeSpan.FromSeconds(10));
-            await DeselectAllAsync();
+            requester.SelectNone();
+            _selection = Array.Empty<ITorrentManagerFile>();
         }
 
         // Hand the results to the archive, where the rest of the app expects to find them.
@@ -600,8 +624,39 @@ public sealed class TorrentSource(Settings settings)
         Status.Seeds = manager.Peers.Seeds;
         Status.DownloadRate = manager.Monitor.DownloadRate;
         Status.UploadRate = manager.Monitor.UploadRate;
-        Status.SelectedProgress = manager.PartialProgress;
+        Status.SelectedProgress = SelectionProgress();
         Status.TorrentState = manager.State.ToString();
+    }
+
+    /// <summary>
+    /// How far the selection has got, weighted by file size. Each file carries its own bitfield of
+    /// the pieces it spans, which is where the manager records what has arrived.
+    /// </summary>
+    private double SelectionProgress()
+    {
+        long total = 0;
+        double done = 0;
+
+        foreach (var file in _selection)
+        {
+            var pieces = file.BitField;
+            total += file.Length;
+            if (pieces.Length > 0) done += file.Length * ((double)pieces.TrueCount / pieces.Length);
+        }
+
+        return total == 0 ? 0 : done * 100.0 / total;
+    }
+
+    /// <summary>
+    /// True once every piece of every selected file is in. Read from the bitfields rather than the
+    /// percentage, which would leave the loop at the mercy of a rounding error.
+    /// </summary>
+    private bool SelectionComplete()
+    {
+        foreach (var file in _selection)
+            if (!file.BitField.AllTrue) return false;
+
+        return true;
     }
 
     public async Task StopAsync()
@@ -633,6 +688,8 @@ public sealed class TorrentSource(Settings settings)
             _engine?.Dispose();
             _engine = null;
             _manager = null;
+            _requester = null;
+            _selection = Array.Empty<ITorrentManagerFile>();
             _byArchivePath.Clear();
 
             Status.State = "off";

@@ -54,16 +54,24 @@ jobs:
             "SNAPSHOT=no" | Out-File -Append $env:GITHUB_ENV
           }
 
+      # A plain publish: the executable with its runtime beside it, not a single file.
+      #
+      # The single-file build was a compressed bundle that unpacked itself into a temp
+      # folder and ran from there. That is what a packer does, and to a heuristic engine
+      # it reads as one - Kaspersky was deleting the release off machines as
+      # UDS:Trojan.Win64.SBadur.gen, a cloud verdict on behaviour rather than a signature
+      # on anything in the file. Ordinary software ships as a folder; so does this now.
+      #
+      # Version comes from the tag this run is about to publish, so the version resource
+      # agrees with the release instead of reading 1.0.0.0 forever.
       - name: Publish Windows
         shell: pwsh
         run: |
           dotnet publish Steam2Browser/Steam2Browser.csproj `
             -c Release -r win-x64 --self-contained true `
-            -p:PublishSingleFile=true `
-            -p:IncludeNativeLibrariesForSelfExtract=true `
-            -p:EnableCompressionInSingleFile=true `
             -p:PublishTrimmed=false `
             -p:DebugType=none `
+            -p:Version=1.0.${{ github.run_number }} `
             -o publish/win-x64
 
       - name: Publish Linux
@@ -71,11 +79,9 @@ jobs:
         run: |
           dotnet publish Steam2Browser/Steam2Browser.csproj `
             -c Release -r linux-x64 --self-contained true `
-            -p:PublishSingleFile=true `
-            -p:IncludeNativeLibrariesForSelfExtract=true `
-            -p:EnableCompressionInSingleFile=true `
             -p:PublishTrimmed=false `
             -p:DebugType=none `
+            -p:Version=1.0.${{ github.run_number }} `
             -o publish/linux-x64
 
       - name: Trim publish leftovers

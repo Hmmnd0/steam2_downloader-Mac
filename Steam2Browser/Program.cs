@@ -388,7 +388,17 @@ app.MapPost("/api/settings", async (SettingsPatch patch) =>
     if (patch.DatConcurrency is { } dc) settings.DatConcurrency = Math.Clamp(dc, 1, 64);
     if (patch.WarmupLookahead is { } wl) settings.WarmupLookahead = Math.Clamp(wl, 0, 16);
     if (patch.SwarmAssist is { } sa) settings.SwarmAssist = sa;
-    if (patch.SharingNoticeSeen is { } sn) settings.SharingNoticeSeen = sn;
+    if (patch.SharingNoticeSeen is { } sn)
+    {
+        // Answering the notice is what joins the swarm on a first run, because startup deliberately
+        // does not: see where seeding is started at the bottom of this file. Only ever forward, so
+        // a client that sends this again cannot restart sharing somebody has since switched off.
+        bool firstAnswer = sn && !settings.SharingNoticeSeen;
+        settings.SharingNoticeSeen = sn;
+
+        if (firstAnswer && settings.TorrentEnabled && settings.SeedDownloaded)
+            _ = Task.Run(() => torrent.StartSeedingAsync());
+    }
 
     if (patch.TorrentEnabled is { } te)
     {
@@ -1073,8 +1083,18 @@ _ = Task.Run(async () =>
 
 _ = Task.Run(() => apps.RefreshAsync(Settings.RootFor(baseDir)));
 
-// Both switches have to be on. The engine is off by default while its startup is unexplained.
-if (settings.TorrentEnabled && settings.SeedDownloaded)
+// Both switches have to be on, and on a first run the notice has to have been answered first.
+//
+// Sharing announces to every tracker it has, which on a machine that has just unzipped the app
+// means contacting well over a hundred hosts within seconds of launch, before the person running it
+// has agreed to anything. That is bad manners on its own, and it is also what an unsigned new
+// executable looks like to a reputation engine: a VirusTotal sandbox recorded 117 contacted domains
+// on first run, and Kaspersky answered with UDS:Trojan.Win64.SBadur.gen — a cloud verdict on
+// behaviour, not a signature on anything in the file.
+//
+// So the first run is quiet. The notice is shown, and the swarm is joined once somebody has said
+// yes; from then on SharingNoticeSeen is set and startup shares as before.
+if (settings.TorrentEnabled && settings.SeedDownloaded && settings.SharingNoticeSeen)
     _ = Task.Run(() => torrent.StartSeedingAsync());
 
 _ = Task.Run(async () =>

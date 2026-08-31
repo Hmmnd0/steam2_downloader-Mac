@@ -963,6 +963,11 @@ public sealed class TorrentSource(Settings settings)
         Status.UploadRate = manager.Monitor.UploadRate;
         Status.SelectedProgress = SelectionProgress();
         Status.TorrentState = manager.State.ToString();
+
+        // Counted from the manager rather than set once while building a magnet link, which left it
+        // reading zero for every start that loaded the torrent from a file — the usual path.
+        try { Status.Trackers = manager.TrackerManager.Tiers.Sum(t => t.Trackers.Count); }
+        catch { /* a count is not worth disturbing a sample for */ }
     }
 
     /// <summary>

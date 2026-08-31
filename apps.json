@@ -1,0 +1,93 @@
+[
+  {
+    "appid": 240,
+    "name": "Counter-Strike: Source",
+    "builds": [
+      {
+        "id": "v34",
+        "name": "...",
+        "notes": "v34",
+        "depots": [
+          {
+            "depot": 241,
+            "version": 56,
+            "role": "client",
+            "optional": false
+          },
+          {
+            "depot": 205,
+            "version": 101,
+            "role": "server",
+            "optional": false
+          },
+          {
+            "depot": 242,
+            "version": 74,
+            "role": "content",
+            "optional": false
+          },
+          {
+            "depot": 243,
+            "version": 3,
+            "role": "localization",
+            "optional": true
+          },
+          {
+            "depot": 244,
+            "version": 3,
+            "role": "localization",
+            "optional": true
+          },
+          {
+            "depot": 245,
+            "version": 3,
+            "role": "localization",
+            "optional": true
+          },
+          {
+            "depot": 246,
+            "version": 3,
+            "role": "localization",
+            "optional": true
+          },
+          {
+            "depot": 247,
+            "version": 3,
+            "role": "localization",
+            "optional": true
+          },
+          {
+            "depot": 248,
+            "version": 3,
+            "role": "localization",
+            "optional": true
+          },
+          {
+            "depot": 249,
+            "version": 3,
+            "role": "localization",
+            "optional": true
+          },
+          {
+            "depot": 250,
+            "version": 3,
+            "role": "localization",
+            "optional": true
+          },
+          {
+            "depot": 251,
+            "version": 3,
+            "role": "localization",
+            "optional": true
+          },
+          {
+            "depot": 252,
+            "version": 3,
+            "role": "localization",
+            "optional": true
+          }
+        ]
+      }
+    ]
+  }
+]

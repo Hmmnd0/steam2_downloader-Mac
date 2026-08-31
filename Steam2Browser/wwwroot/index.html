@@ -34,6 +34,10 @@
     <button id="testMirrors" class="ghost" title="Download 4 MB from each mirror and compare">Test speed</button>
   </div>
 
+  <button id="seedBox" class="seed" title="Sharing what you have downloaded back to the swarm">
+    <i></i><span id="seedText">…</span>
+  </button>
+
   <a id="updateChip" class="chip" href="#" target="_blank" rel="noreferrer" hidden></a>
 
   <button id="openSettings" class="ghost icon" title="Settings">⚙</button>
@@ -44,6 +48,12 @@
 <main class="layout">
 
   <aside class="depots">
+    <!-- Depots are what the archive holds; the store is what people actually want out of it. -->
+    <div class="modes" id="modes">
+      <button data-mode="depots" class="on">Depots</button>
+      <button data-mode="store">Depot packs</button>
+    </div>
+
     <div class="toolbar">
       <input id="depotSearch" type="search" placeholder="Depot id or name — &quot;440&quot; for exact"
              title="440 matches 440, 4400, 14400 … Put it in quotes — &quot;440&quot; — to match that id alone."
@@ -73,6 +83,9 @@
 
     <div class="listhead"><span id="depotCount"></span></div>
     <div class="depot-list" id="depotList"></div>
+
+    <div class="listhead" id="storeHead" hidden><span id="storeCount"></span></div>
+    <div class="depot-list" id="storeList" hidden></div>
   </aside>
 
   <section class="detail" id="detail">
@@ -173,6 +186,21 @@
         <input id="setBigFileMb" type="number" min="0" max="100000">
       </label>
     </div>
+
+    <label class="row">
+      <input id="setTorrent" type="checkbox">
+      <span>Enable the BitTorrent engine
+        <span class="hint">off by default: loading the 13 TB file list leaves the engine stuck
+        before it ever starts, and the cause is not yet understood. The HTTP mirrors do not need
+        it. Sharing below requires this.</span></span>
+    </label>
+
+    <label class="row">
+      <input id="setSeed" type="checkbox">
+      <span>Share downloaded files back to the swarm
+        <span class="hint">the archive survives because people seed it, and it has very few
+        seeders — this uploads only files you already have and never downloads anything</span></span>
+    </label>
 
     <label class="row">
       <input id="setVerify" type="checkbox">

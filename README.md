@@ -81,6 +81,21 @@ Built in. The blob container, manifest, file id tables, AES-128-CFB and zlib chu
 implemented in process. Output was verified byte-for-byte against the original `extract.exe` on two
 depots, one of them with a chain spanning 146 versions.
 
+### Depot packs
+
+A depot is not a game. Counter-Strike: Source is a client depot, a content depot and ten
+localization depots, each at its own version — and that mapping is recorded nowhere in the archive,
+because it lived on Steam's side and was never dumped. The blobs describe only what is inside one
+depot.
+
+So it is written by hand. [`apps/`](apps/) holds one JSON file per Steam appid listing the depots
+and versions each build is made of; the app lists them as packs and queues every depot of a build
+in one click, each as its own download with its own chain.
+
+Contributions go through a pull request, and a check validates them against the real archive —
+a build naming a depot or version that does not exist fails before it can be merged.
+[`apps/README.md`](apps/README.md) has the format.
+
 ## Things worth knowing about the archive
 
 **A missing decryption key usually does not matter.** 4 758 depots appear in the key table, but that

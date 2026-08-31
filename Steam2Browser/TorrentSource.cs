@@ -9,6 +9,16 @@ public sealed class TorrentStatus
     /// <summary>off | starting | metadata | ready | downloading | error</summary>
     public string State = "off";
 
+    /// <summary>Seeding runs on its own manager, so it reports its own state.</summary>
+    public string SeedState = "off";
+
+    public string SeedMessage = "";
+    public int SeedFiles;
+    public long SeedBytes;
+    public double SeedUploadRate;
+    public int SeedPeers;
+    public long SeedUploaded;
+
     public string Message = "";
     public string? Error;
 
@@ -66,6 +76,9 @@ public sealed class TorrentSource(Settings settings)
         new(StringComparer.OrdinalIgnoreCase);
 
     private readonly SemaphoreSlim _gate = new(1, 1);
+    private readonly SemaphoreSlim _seedGate = new(1, 1);
+
+    private TorrentManager? _seedManager;
 
     public bool Ready => _manager is { HasMetadata: true };
 
@@ -75,8 +88,158 @@ public sealed class TorrentSource(Settings settings)
     /// Brings the engine up and waits for the file list. Safe to call repeatedly; only the first
     /// call does the work.
     /// </summary>
+    /// <summary>
+    /// Shares the archive files already on disk back to the swarm.
+    ///
+    /// This runs on its own manager rooted at the archive folder, which is the one thing the
+    /// downloading manager is deliberately kept away from: pointed there, it allocates a file for
+    /// everything it might want and once left 35 166 empty placeholders that looked like completed
+    /// downloads. The protection here is that every file is parked at DoNotDownload before the
+    /// manager is ever started, and only files that already exist on disk are lifted off it — so
+    /// there is nothing it could decide to create.
+    ///
+    /// Nothing is downloaded by this manager. It hash-checks what is there and serves it.
+    /// </summary>
+    public async Task StartSeedingAsync(CancellationToken ct = default)
+    {
+        if (!settings.TorrentEnabled)
+        {
+            Status.SeedState = "off";
+            Status.SeedMessage = "the torrent engine is switched off";
+            return;
+        }
+
+        if (_seedManager is not null) return;
+
+        await _seedGate.WaitAsync(ct);
+        try
+        {
+            if (_seedManager is not null) return;
+
+            Status.SeedState = "starting";
+            Status.SeedMessage = "reading the file list";
+
+            // Sharing needs the metadata, and the download side is what fetches and caches it.
+            if (!await EnsureStartedAsync(ct) || _manager is null)
+            {
+                Status.SeedState = "error";
+                Status.SeedMessage = "could not get the torrent file list";
+                return;
+            }
+
+            string archive = settings.DataDir;
+            Directory.CreateDirectory(archive);
+
+            var torrentSettings = new TorrentSettingsBuilder
+            {
+                CreateContainingDirectory = false,
+                AllowDht = true,
+                AllowPeerExchange = true,
+                // Nothing here should ever ask the swarm for data.
+                UploadSlots = 8,
+            }.ToSettings();
+
+            var manager = await _engine!.AddAsync(_manager.Torrent!, archive, torrentSettings);
+
+            // Park everything first, before a single byte can be allocated.
+            foreach (var file in manager.Files)
+                if (file.Priority != Priority.DoNotDownload)
+                    await manager.SetFilePriorityAsync(file, Priority.DoNotDownload);
+
+            // Then lift only what is genuinely on disk.
+            int have = 0;
+            long bytes = 0;
+
+            foreach (var file in manager.Files)
+            {
+                var parts = file.Path.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length < 2) continue;
+
+                string name = parts[^1];
+                string folder = parts[^2].ToLowerInvariant();
+                if (folder is not ("dats" or "blobs")) continue;
+
+                string onDisk = Path.Combine(archive, folder, name);
+                if (!File.Exists(onDisk)) continue;
+
+                // A part-written file is not ours to serve.
+                if (new FileInfo(onDisk).Length != file.Length) continue;
+
+                await manager.SetFilePriorityAsync(file, Priority.Normal);
+                have++;
+                bytes += file.Length;
+            }
+
+            Status.SeedFiles = have;
+            Status.SeedBytes = bytes;
+
+            if (have == 0)
+            {
+                Status.SeedState = "idle";
+                Status.SeedMessage = "nothing downloaded yet to share";
+                await _engine.RemoveAsync(manager);
+                return;
+            }
+
+            Status.SeedMessage = $"checking {have} file(s) before sharing them";
+            await manager.HashCheckAsync(autoStart: true);
+
+            _seedManager = manager;
+            Status.SeedState = "sharing";
+            Status.SeedMessage = $"sharing {have} file(s)";
+        }
+        catch (Exception ex)
+        {
+            Status.SeedState = "error";
+            Status.SeedMessage = ex.Message;
+        }
+        finally
+        {
+            _seedGate.Release();
+        }
+    }
+
+    public async Task StopSeedingAsync()
+    {
+        // Status is cleared first and unconditionally. There may be no manager yet — sharing spends
+        // its first stretch inside EnsureStartedAsync — and returning early there used to leave the
+        // display insisting it was still starting long after it had been switched off.
+        var manager = _seedManager;
+        _seedManager = null;
+
+        Status.SeedState = "off";
+        Status.SeedMessage = "";
+        Status.SeedFiles = 0;
+        Status.SeedBytes = 0;
+        Status.SeedUploadRate = 0;
+        Status.SeedPeers = 0;
+
+        if (manager is null) return;
+
+        try { await manager.StopAsync(); } catch { /* going away regardless */ }
+    }
+
+    public void SampleSeed()
+    {
+        var m = _seedManager;
+        if (m is null) return;
+
+        Status.SeedUploadRate = m.Monitor.UploadRate;
+        Status.SeedUploaded = m.Monitor.DataBytesSent;
+        Status.SeedPeers = m.Peers.Seeds + m.Peers.Leechs;
+    }
+
     public async Task<bool> EnsureStartedAsync(CancellationToken ct = default)
     {
+        // The single place the engine can come up, so the switch belongs here rather than at each
+        // call site where one could be missed.
+        if (!settings.TorrentEnabled)
+        {
+            Status.State = "off";
+            Status.Message = "the torrent engine is switched off in Settings";
+            return false;
+        }
+
         if (Ready) return true;
 
         await _gate.WaitAsync(ct);
@@ -121,7 +284,7 @@ public sealed class TorrentSource(Settings settings)
 
             if (_manager is null)
             {
-                var link = BuildLink();
+                string? torrentPath = FindTorrentFile();
 
                 // The engine gets its own directory rather than the archive folder. It allocates
                 // files for whatever is selected, and the archive must only ever contain files this
@@ -137,7 +300,33 @@ public sealed class TorrentSource(Settings settings)
                     AllowPeerExchange = true,
                 }.ToSettings();
 
-                _manager = await _engine.AddAsync(link, dataDir, torrentSettings);
+                if (torrentPath is not null)
+                {
+                    // Straight from the file: no metadata round trip, and its 88 trackers come with
+                    // it. The infohash is the torrent's own, so it joins exactly the same swarm.
+                    var loaded = await Torrent.LoadAsync(torrentPath);
+                    _manager = await _engine.AddAsync(loaded, dataDir, torrentSettings);
+                    Status.Message = $"file list read from {Path.GetFileName(torrentPath)}";
+                }
+                else
+                {
+                    _manager = await _engine.AddAsync(BuildLink(), dataDir, torrentSettings);
+                }
+
+                // Deliberately not awaited. Adding ninety trackers one at a time means ninety DNS
+                // lookups and announces, most of them to hosts that will never answer, and doing
+                // that before the manager starts held the whole engine at "starting" indefinitely.
+                // Extra trackers are an improvement to reach for, never a precondition.
+                var manager = _manager;
+                _ = Task.Run(async () =>
+                {
+                    foreach (var url in settings.TrackersToUse)
+                    {
+                        try { await manager.TrackerManager.AddTrackerAsync(new Uri(url)); }
+                        catch { /* one unusable url is not worth the rest of the list */ }
+                    }
+                });
+
                 _manager.PeersFound += (_, _) => Sample();
                 _manager.TorrentStateChanged += (_, _) => Sample();
             }
@@ -207,6 +396,35 @@ public sealed class TorrentSource(Settings settings)
     /// resolve to a single address, so on a network that blocks it there is nothing to announce to
     /// and only DHT is left; extra trackers give the swarm another way in.
     /// </summary>
+    /// <summary>
+    /// The metadata file, if it is anywhere we can see it.
+    ///
+    /// Fetching 30 MB of file list from a swarm with three seeders takes minutes and often never
+    /// finishes at all, which left sharing stuck at "reading the file list". Having the file on
+    /// disk removes that entirely: the torrent is known the moment the app starts, and its own
+    /// announce-list carries far more trackers than any list kept by hand.
+    /// </summary>
+    private string? FindTorrentFile()
+    {
+        string exeDir = AppContext.BaseDirectory;
+
+        var candidates = new List<string>
+        {
+            Path.Combine(exeDir, TorrentFileName),
+            Path.Combine(settings.IndexDir, TorrentFileName),
+            Path.Combine(Directory.GetCurrentDirectory(), TorrentFileName),
+        };
+
+        // Running from a build output during development, the repository root is several levels up.
+        var dir = new DirectoryInfo(exeDir);
+        for (int i = 0; i < 8 && dir is not null; i++, dir = dir.Parent)
+            candidates.Add(Path.Combine(dir.FullName, TorrentFileName));
+
+        return candidates.FirstOrDefault(File.Exists);
+    }
+
+    public const string TorrentFileName = "steam2.torrent";
+
     private MagnetLink BuildLink()
     {
         var baseLink = MagnetLink.Parse(Magnet);
@@ -402,7 +620,11 @@ public sealed class TorrentSource(Settings settings)
 
     public async Task ResetAsync()
     {
-        await _gate.WaitAsync();
+        // Deliberately not an unbounded wait. The gate is held for the whole of EnsureStartedAsync,
+        // and the case this has to handle is precisely that a start has hung inside it — waiting
+        // politely would mean the shutdown could never run. Disposing the engine underneath a stuck
+        // start is what releases it.
+        bool held = await _gate.WaitAsync(TimeSpan.FromSeconds(3));
         try
         {
             if (_manager is not null)
@@ -431,7 +653,7 @@ public sealed class TorrentSource(Settings settings)
         }
         finally
         {
-            _gate.Release();
+            if (held) _gate.Release();
         }
     }
 }

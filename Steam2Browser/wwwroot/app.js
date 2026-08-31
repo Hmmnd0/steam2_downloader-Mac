@@ -65,7 +65,7 @@ const state = {
   },
   // Activity panel: it follows the work by itself, and a click takes control until the work
   // state changes again.
-  act: { jobs: false, extract: false, busy: false, manualOpen: null, jobList: [], extractList: [] },
+  act: { jobs: false, extract: false, busy: false, manualOpen: null, jobList: [], extractList: [], installList: [] },
   selected: null,
   detail: null,
   plan: null,
@@ -1248,20 +1248,34 @@ function renderActivity() {
   const host = $('#actList');
   if (!host) return;
 
-  const jobs = state.act.jobList ?? [];
-  const runs = state.act.extractList ?? [];
+  const installs = state.act.installList ?? [];
+
+  // The download and extract of a depot inside an install are its business, not separate rows:
+  // the whole point is to see one Counter-Strike: Source rather than four depots.
+  const owned = new Set();
+  for (const i of installs) {
+    for (const s of i.steps) {
+      if (s.jobId) owned.add('j' + s.jobId);
+      if (s.runId) owned.add('r' + s.runId);
+    }
+  }
+
+  const jobs = (state.act.jobList ?? []).filter((j) => !owned.has('j' + j.id));
+  const runs = (state.act.extractList ?? []).filter((r) => !owned.has('r' + r.id));
 
   const running = jobs.filter((j) => j.status === 'running').length
-                + runs.filter((r) => r.status === 'running').length;
+                + runs.filter((r) => r.status === 'running').length
+                + installs.filter((i) => i.status === 'running').length;
   const badge = $('#actBadge');
   if (badge) badge.textContent = running ? String(running) : '';
 
-  if (!jobs.length && !runs.length) {
+  if (!jobs.length && !runs.length && !installs.length) {
     host.innerHTML = '<div class="muted">Nothing yet. Pick a depot and start a download.</div>';
     return;
   }
 
   const entries = [
+    ...installs.map((i) => ({ at: i.started, node: () => installCard(i) })),
     ...jobs.map((j) => ({ at: j.started, node: () => jobCard(j) })),
     ...runs.map((r) => ({ at: r.started, node: () => extractCard(r) })),
   ].sort((a, b) => String(b.at).localeCompare(String(a.at)));
@@ -1501,11 +1515,21 @@ $('#openSettings').onclick = () => {
   $('#setDatStreams').value = s.datConcurrency ?? 2;
   $('#setWarmAhead').value = s.warmupLookahead ?? 2;
   $('#setBigFileMb').value = Math.round((s.bigFileBytes ?? 30000000) / 1_000_000);
+  $('#setTorrent').checked = !!s.torrentEnabled;
+  $('#setSeed').checked = !!s.seedDownloaded;
   $('#setVerify').checked = !!s.verifyHashes;
   $('#setFailover').checked = !!s.failover;
   $('#settingsDlg').showModal();
 };
 $('#saveSettings').onclick = async () => {
+  // Sharing is its own endpoint because switching it has to start or stop the engine, not
+  // just record a preference.
+  try {
+    await api.post('/api/settings', { torrentEnabled: $('#setTorrent').checked });
+    await api.post('/api/seed', { enabled: $('#setSeed').checked });
+  } catch { }
+  pollSeed();
+
   await api.post('/api/settings', {
     dataDir: $('#setDataDir').value,
     extractOutDir: $('#setExtractOut').value,
@@ -1613,6 +1637,294 @@ $('#rangeStart').onclick = async () => {
   pollRange();
 };
 
+// ---------------- depot packs ----------------
+//
+// A depot is not a game. Which depots at which versions add up to one is recorded nowhere in the
+// archive — that lived on Steam's side and was never dumped — so it is written by hand in
+// apps/*.json and validated against the real catalog before merging. This is the reading end of
+// that: pick a build, and every depot it names is queued as its own download.
+
+const store = { apps: [], selected: null, loaded: false, status: null };
+
+function setMode(mode) {
+  state.mode = mode;
+  for (const b of $('#modes').children) b.classList.toggle('on', b.dataset.mode === mode);
+
+  const browsing = mode === 'depots';
+  $('#depotList').hidden = !browsing;
+  $('#storeList').hidden = browsing;
+  $('#storeHead').hidden = browsing;
+  document.querySelector('.listhead').hidden = !browsing;
+  document.querySelector('.toolbar').hidden = !browsing;
+  document.querySelector('.sortrow').hidden = !browsing;
+  $('#depotFilters').hidden = !browsing;
+
+  if (!browsing) loadStore();
+}
+
+async function loadStore() {
+  if (store.loaded) { renderStoreList(); return; }
+  $('#storeCount').textContent = 'loading…';
+
+  let r;
+  try {
+    r = await api.get('/api/apps');
+  } catch {
+    $('#storeCount').textContent = 'could not load the app list';
+    return;
+  }
+
+  store.apps = r.items ?? [];
+  store.status = r.status;
+  store.loaded = true;
+  renderStoreList();
+}
+
+function renderStoreList() {
+  const host = $('#storeList');
+  host.innerHTML = '';
+
+  const st = store.status ?? {};
+  $('#storeCount').textContent = store.apps.length
+    ? `${num(store.apps.length)} app(s) · ${st.source ?? ''}`
+    : (st.message || 'no apps defined yet');
+
+  if (!store.apps.length) {
+    const d = $('#detail');
+    d.innerHTML = '';
+    d.append(note('info', 'No packs defined yet',
+      'Packs are contributed as JSON in the apps/ folder of the repository. One file per app; '
+      + 'apps/README.md has the format, and a pull request is checked against the real archive.'));
+    return;
+  }
+
+  for (const a of store.apps) {
+    const card = el('div', 'appcard');
+    if (store.selected === a.appid) card.classList.add('on');
+    card.append(el('b', null, a.name));
+    card.append(el('span', 'aid', String(a.appid)));
+    card.append(el('span', 'abuilds',
+      `${num(a.builds.length)} build${a.builds.length === 1 ? '' : 's'}`));
+    card.onclick = () => selectApp(a.appid);
+    host.append(card);
+  }
+}
+
+function selectApp(appid) {
+  pushView({ app: appid });
+  store.selected = appid;
+  renderStoreList();
+  renderApp();
+}
+
+function renderApp() {
+  const a = store.apps.find((x) => x.appid === store.selected);
+  const d = $('#detail');
+  d.innerHTML = '';
+  d.scrollTop = 0;
+  if (!a) return;
+
+  const head = el('div', 'dhead');
+  head.append(el('h2', null, a.name));
+
+  const sdb = el('a', 'sdb', `SteamDB · ${a.appid}`);
+  sdb.href = `https://steamdb.info/app/${a.appid}`;
+  sdb.target = '_blank';
+  sdb.rel = 'noreferrer';
+  head.append(sdb);
+  d.append(head);
+
+  const sub = el('div', 'dsub');
+  sub.append(el('span', null, `${num(a.builds.length)} build(s)`));
+  sub.append(el('span', null, `defined in apps/${a.appid}.json`));
+  d.append(sub);
+
+  for (const b of a.builds) d.append(buildBox({ ...b, appid: a.appid }));
+}
+
+function buildBox(build) {
+  const box = el('div', 'build');
+
+  const head = el('div', 'buildhead');
+  head.append(el('b', null, build.name || build.id));
+  if (build.date) head.append(el('span', 'bdate', fmtDate(build.date)));
+
+  const required = build.depots.filter((x) => !x.optional);
+  head.append(el('span', 'bsum',
+    `${num(required.length)} required · ${num(build.depots.length - required.length)} optional`));
+  box.append(head);
+
+  if (build.notes) box.append(el('div', 'buildnotes', build.notes));
+
+  const boxes = [];
+
+  for (const pin of build.depots) {
+    const row = el('div', 'pin');
+    // A pin the archive cannot satisfy is shown, not quietly dropped: the definition is wrong
+    // and someone should fix it.
+    if (!pin.known) row.classList.add('gone');
+
+    const cb = el('input');
+    cb.type = 'checkbox';
+    cb.checked = !pin.optional && pin.known;
+    cb.disabled = !pin.known;
+    boxes.push({ cb, pin });
+
+    row.append(cb);
+    row.append(el('span', 'pname', pin.name || `depot ${pin.depot}`));
+    row.append(el('span', 'pver', `depot ${pin.depot} · v${pin.version}`));
+    if (pin.role) row.append(el('span', 'prole', pin.role));
+    if (!pin.known) {
+      row.append(el('span', 'prole',
+        pin.maxVersion >= 0 ? `no v${pin.version} — goes to v${pin.maxVersion}` : 'not in archive'));
+    }
+    box.append(row);
+  }
+
+  const foot = el('div', 'buildfoot');
+  const go = el('button', 'primary', 'Install this build');
+  const said = el('span', 'hint', '');
+
+  go.onclick = async () => {
+    const picked = boxes.filter((x) => x.cb.checked).map((x) => x.pin);
+    if (!picked.length) { said.textContent = 'nothing selected'; return; }
+
+    go.disabled = true;
+    go.textContent = 'Starting…';
+
+    // One install rather than a download per depot. The depots of a game overlay into a single
+    // tree, so they are unpacked into one folder and reported as one piece of work.
+    try {
+      await api.post('/api/installs', {
+        appid: build.appid,
+        build: build.id,
+        depots: picked.map((p) => p.depot),
+      });
+      said.textContent = `installing ${picked.length} depot(s)`;
+      applyActivity(true);
+      pollInstalls();
+    } catch (e) {
+      said.textContent = 'could not start: ' + (e.message || e);
+    }
+
+    go.disabled = false;
+    go.textContent = 'Install this build';
+  };
+
+  foot.append(go, said);
+  box.append(foot);
+  return box;
+}
+
+$('#modes').onclick = (e) => {
+  const b = e.target.closest('button[data-mode]');
+  if (b) setMode(b.dataset.mode);
+};
+
+
+// An install is one row, not one per depot: the depots of a game are an implementation detail of
+// the thing being installed. The jobs underneath are hidden while it runs, and its own card lists
+// the depots with their individual state.
+function installCard(i) {
+  const card = el('div', 'job');
+
+  const head = el('div', 'jobhead');
+  head.append(el('span', 'title', i.name || `app ${i.appid}`));
+  head.append(el('span', 'tag mode', `build ${i.build}`));
+  head.append(el('span', 'tag', `${num(i.doneSteps)} / ${num(i.steps.length)} depots`));
+  head.append(el('span', 'spacer'));
+  head.append(el('span', 'st ' + i.status, i.status));
+
+  if (i.status === 'running') {
+    const c = el('button', 'ghost', 'Cancel');
+    c.onclick = () => api.post(`/api/installs/${i.id}/cancel`).then(pollInstalls);
+    head.append(c);
+  }
+  card.append(head);
+
+  const pct = i.totalBytes > 0
+    ? Math.min(100, (i.doneBytes / i.totalBytes) * 100)
+    : (i.status === 'done' ? 100 : 0);
+  const bar = el('div', 'bar' + (i.status === 'done' ? ' done' : i.status === 'failed' ? ' failed' : ''));
+  const fill = el('i');
+  fill.style.width = pct + '%';
+  bar.append(fill);
+  card.append(bar);
+
+  const meta = el('div', 'jobmeta');
+  for (const t of [
+    `${bytes(i.doneBytes)} / ${bytes(i.totalBytes)}`,
+    i.outDir,
+    i.error ?? '',
+  ]) if (t) meta.append(el('span', null, t));
+  card.append(meta);
+
+  // The depots are still listed, because when one fails you need to know which.
+  for (const step of i.steps) {
+    const row = el('div', 'istep');
+    row.append(el('span', 'st ' + step.status, step.status));
+    row.append(el('span', 'pname', step.name || `depot ${step.depot}`));
+    row.append(el('span', 'pver', `${step.depot} · v${step.version}`));
+    if (step.filesWritten) row.append(el('span', 'prole', `${num(step.filesWritten)} files`));
+    if (step.error) row.append(el('span', 'prole', step.error));
+    card.append(row);
+  }
+
+  return card;
+}
+
+
+async function pollInstalls() {
+  try {
+    state.act.installList = await api.get('/api/installs');
+  } catch {
+    return;
+  }
+  renderActivity();
+}
+
+
+// ---------------- sharing ----------------
+//
+// Taking from a swarm of three seeders and giving nothing back is how an archive dies, so the
+// header carries the state plainly rather than burying it in settings: whether anything is being
+// shared, to how many peers, and at what rate.
+
+async function pollSeed() {
+  const box = $('#seedBox');
+  const text = $('#seedText');
+  if (!box) return;
+
+  let d;
+  try { d = await api.get('/api/seed'); } catch { return; }
+
+  state.seed = d;
+  box.classList.toggle('on', d.state === 'sharing');
+  box.classList.toggle('warn', d.state === 'error');
+
+  if (!d.enabled) {
+    text.textContent = 'Not sharing';
+    box.title = d.engineEnabled
+      ? 'Sharing is off. Turn it on in Settings to give back to the swarm.'
+      : 'The BitTorrent engine is switched off in Settings, so nothing is shared.';
+    return;
+  }
+
+  if (d.state === 'sharing') {
+    const rate = d.uploadRate > 0 ? `  ·  ${bytes(d.uploadRate)}/s` : '';
+    text.textContent = `Sharing ${num(d.files)}${d.peers ? `  ·  ${num(d.peers)} peers` : ''}${rate}`;
+    box.title = `Sharing ${num(d.files)} file(s), ${bytes(d.bytes)} on offer. `
+              + `${bytes(d.uploaded)} uploaded so far.`;
+    return;
+  }
+
+  // starting / idle / error all have something worth saying.
+  text.textContent = d.state === 'starting' ? 'Preparing to share' : (d.message || d.state);
+  box.title = d.message || '';
+}
+
+$('#seedBox').onclick = () => $('#openSettings').click();
+
 // ---------------- navigation history ----------------
 //
 // Mouse buttons 4 and 5 are the browser's own back and forward. A page cannot rely on receiving
@@ -1628,6 +1940,7 @@ $('#rangeStart').onclick = async () => {
 let applyingHistory = false;
 
 function viewUrl(view) {
+  if (view.app != null) return '#app=' + view.app;
   if (view.depot != null) return '#depot=' + view.depot;
   if (view.q) return '#q=' + encodeURIComponent(view.q);
   return '#';
@@ -1635,6 +1948,8 @@ function viewUrl(view) {
 
 function viewFromHash() {
   const h = decodeURIComponent(location.hash.slice(1));
+  const appId = /^app=(\d+)$/.exec(h);
+  if (appId) return { app: +appId[1] };
   const depot = /^depot=(\d+)$/.exec(h);
   if (depot) return { depot: +depot[1] };
   if (h.startsWith('q=')) return { q: h.slice(2) };
@@ -1660,7 +1975,14 @@ async function applyView(view) {
     state.searching = false;
     $('#fileSearchNote').textContent = state.fileIndex || '';
 
-    if (view.depot != null) {
+    if (view.app != null) {
+      setMode('store');
+      await loadStore();
+      store.selected = view.app;
+      renderStoreList();
+      renderApp();
+    } else if (view.depot != null) {
+      setMode('depots');
       await selectDepot(view.depot);
     } else {
       state.selected = null;
@@ -1683,3 +2005,7 @@ pollExtract();
 setInterval(refreshState, 2000);
 setInterval(pollJobs, 1000);
 setInterval(pollExtract, 1500);
+pollInstalls();
+setInterval(pollInstalls, 1000);
+pollSeed();
+setInterval(pollSeed, 3000);

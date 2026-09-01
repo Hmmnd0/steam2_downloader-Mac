@@ -47,6 +47,9 @@ steam2browser.exe --no-browser    # do not launch a browser
 ```
 
 **Linux** — [`steam2browser-linux-x64.zip`](https://github.com/extremebleem/steam2_downloader/releases/latest/download/steam2browser-linux-x64.zip).
+On arm64 machines (Raspberry Pi, arm64 VPS) take
+[`steam2browser-linux-arm64.zip`](https://github.com/extremebleem/steam2_downloader/releases/latest/download/steam2browser-linux-arm64.zip)
+instead — the x64 build will not start there.
 Unzip, mark it executable once, then run it. The browser is opened through `xdg-open`, so on a
 machine with no desktop session use `--no-browser` and open the address yourself.
 

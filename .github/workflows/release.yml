@@ -84,12 +84,26 @@ jobs:
             -p:Version=1.0.${{ github.run_number }} `
             -o publish/linux-x64
 
+      # Same publish as above with a different RID. The .NET SDK cross-compiles this on the
+      # Windows runner - the arm64 runtime arrives as a NuGet package - so no ARM hardware and
+      # no second job are needed. This is what a Raspberry Pi or an arm64 VPS can actually run;
+      # the linux-x64 build refuses to start there.
+      - name: Publish Linux ARM64
+        shell: pwsh
+        run: |
+          dotnet publish Steam2Browser/Steam2Browser.csproj `
+            -c Release -r linux-arm64 --self-contained true `
+            -p:PublishTrimmed=false `
+            -p:DebugType=none `
+            -p:Version=1.0.${{ github.run_number }} `
+            -o publish/linux-arm64
+
       - name: Trim publish leftovers
         shell: pwsh
         # The UI and the depot key table are embedded in the exe, so the loose copies
         # ASP.NET emits are dead weight. web.config only matters under IIS.
         run: |
-          foreach ($rid in 'win-x64', 'linux-x64') {
+          foreach ($rid in 'win-x64', 'linux-x64', 'linux-arm64') {
             Remove-Item -Recurse -Force "publish/$rid/wwwroot" -ErrorAction SilentlyContinue
             Remove-Item -Force "publish/$rid/web.config" -ErrorAction SilentlyContinue
             Remove-Item -Force "publish/$rid/*.staticwebassets.endpoints.json" -ErrorAction SilentlyContinue
@@ -183,7 +197,7 @@ jobs:
           # naming absolute paths on the runner - which is the one that would actually hurt, since
           # a downloaded settings file pointing at D:\a\steam2_downloader is how you get an app
           # insisting its archive lives somewhere that does not exist.
-          foreach ($rid in 'win-x64', 'linux-x64') {
+          foreach ($rid in 'win-x64', 'linux-x64', 'linux-arm64') {
             if (Test-Path "publish/$rid/steam2info") {
               $n = (Get-ChildItem "publish/$rid/steam2info" -Recurse -File).Count
               Remove-Item -Recurse -Force "publish/$rid/steam2info"
@@ -193,9 +207,12 @@ jobs:
 
           Copy-Item README.md publish/win-x64/
           Copy-Item README.md publish/linux-x64/
+          Copy-Item README.md publish/linux-arm64/
           Compress-Archive -Path publish/win-x64/* -DestinationPath steam2browser-win-x64.zip -Force
           Compress-Archive -Path publish/linux-x64/* -DestinationPath steam2browser-linux-x64.zip -Force
-          Get-Item steam2browser-win-x64.zip, steam2browser-linux-x64.zip | Select-Object Name, Length
+          Compress-Archive -Path publish/linux-arm64/* -DestinationPath steam2browser-linux-arm64.zip -Force
+          Get-Item steam2browser-win-x64.zip, steam2browser-linux-x64.zip, steam2browser-linux-arm64.zip |
+            Select-Object Name, Length
 
       - uses: actions/upload-artifact@v4
         with:
@@ -203,6 +220,7 @@ jobs:
           path: |
             steam2browser-win-x64.zip
             steam2browser-linux-x64.zip
+            steam2browser-linux-arm64.zip
 
       - name: Release
         shell: pwsh
@@ -218,10 +236,13 @@ jobs:
 
           Windows: download ``steam2browser-win-x64.zip``, unzip, and run ``steam2browser.exe``.
           Linux: download ``steam2browser-linux-x64.zip``, unzip, run ``chmod +x steam2browser``
-          once, then run ``./steam2browser``. Both are self-contained; no .NET install is needed.
+          once, then run ``./steam2browser``. On arm64 (Raspberry Pi, arm64 VPS) take
+          ``steam2browser-linux-arm64.zip`` instead. All three are self-contained; no .NET
+          install is needed.
           Everything the app writes goes to ``steam2info/`` next to the executable.
           "@
           gh release create $tag steam2browser-win-x64.zip steam2browser-linux-x64.zip `
+            steam2browser-linux-arm64.zip `
             --title $tag `
             --notes $notes `
             --target ${{ github.sha }}

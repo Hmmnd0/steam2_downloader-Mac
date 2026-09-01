@@ -19,7 +19,7 @@ Download from the [latest release](https://github.com/Hmmnd0/steam2_downloader-M
 (Apple Silicon). Two options:
 
 - **`.dmg`** — open it, drag **Steam2 Archive Browser** into Applications, double-click to launch.
-  Opens `http://127.0.0.1:5099` in your browser; no Terminal needed.
+  Opens `http://steam2downloader.localhost:5099` in your browser; no Terminal needed.
 - **`.zip`** — a raw binary, for running from Terminal with flags (see below).
 
 Signed and notarized — opens with no warning. If you ever see a Gatekeeper block anyway,
@@ -33,10 +33,14 @@ xattr -d com.apple.quarantine steam2browser
 Then, from Terminal:
 
 ```
-./steam2browser                   # opens http://127.0.0.1:5099
+./steam2browser                   # opens http://steam2downloader.localhost:5099
 ./steam2browser --port=6000       # different port
 ./steam2browser --no-browser      # do not launch a browser
 ```
+
+The address is a name rather than a number. Anything under `.localhost` is reserved and resolved to
+loopback by the browser itself, so this needs no DNS, no hosts file entry and no administrator, and
+changes nothing on the machine. `http://127.0.0.1:5099` keeps working and is printed alongside it.
 
 Everything it writes lives in `~/Library/Application Support/steam2info/` — the name cache,
 downloads (`archive/blobs`, `archive/dats`) and extracted files (`extracted/`). Not beside the
@@ -64,6 +68,18 @@ follows the parent CRC links recorded inside each blob and picks the right `.dat
 the blob records, instead of downloading both branches. Reset depots are split into branches so a
 fork does not read as one jumbled history.
 
+### Skip the dats a version never reads
+
+A chain is not the same thing as the bytes a version needs. Every file in a depot records which
+version's `.dat` holds its payload, and a later version that rewrites a file takes that payload
+over completely — so a `.dat` whose every file was overwritten again before your target version
+contributes nothing to it and does not need downloading.
+
+The planner works this out from the blobs, which are small, and drops those dats before the
+download starts. On depot 241 at v56 that is 55 of 57 dats. The figure is shown before you commit
+to anything, and a checkbox next to the version selector turns the whole thing off for archiving
+the depot in full.
+
 ### Version history and diffs
 
 Per version: which files were added, changed and removed, with the size delta for each, expandable
@@ -90,6 +106,31 @@ of the archive without paying for any dat.
 A browser-side mode saves a chain into a folder you pick, laid out as `blobs/` and `dats/` so the
 extractor finds it, skipping files already the right size.
 
+Free space on the download drive is checked before a download starts, and shown as a bar in
+Settings. A chain that does not fit leaves the download button disabled with the reason on hover,
+and the same check runs again inside the download itself, so a pack whose disk fills up on its
+fourth depot stops with a clear message rather than a write error.
+
+### Share what you have
+
+The archive is 13 TB kept alive by a handful of seeders, and its three HTTP mirrors are paid for by
+one person who has asked people to pull less from them. So sharing is on by default: everything
+already downloaded is offered back to the swarm, and files finishing now join it without a restart.
+Uploads only — nothing extra is ever fetched in order to share it.
+
+Files are hard-linked into the engine's own directory rather than copied, so sharing a downloaded
+depot costs no additional disk space, and that directory sits inside the download directory so the
+links can never be asked to cross a volume.
+
+The swarm also helps with downloading: the mirror takes the file list from the front, the swarm
+takes it from the back, and they meet in the middle. Whichever source is faster ends up carrying
+more, and the swarm never holds a download up — anything it has not finished, the mirror fetches.
+Every file it does supply is one the mirrors were not asked for.
+
+Upload and download speed caps are in Settings, unlimited by default, and apply without a restart.
+Sharing and the swarm can each be switched off on their own, and the whole engine with them; the
+HTTP mirrors keep working either way.
+
 ### Extract
 
 Built in. The blob container, manifest, file id tables, AES-128-CFB and zlib chunk handling are all
@@ -110,6 +151,27 @@ in one click, each as its own download with its own chain.
 Contributions go through a pull request, and a check validates them against the real archive —
 a build naming a depot or version that does not exist fails before it can be merged.
 [`apps/README.md`](apps/README.md) has the format.
+
+## Other tools for the same archive
+
+This one downloads and extracts. If that is not what you are after, these are worth knowing about,
+and two of them answer questions this app deliberately does not.
+
+**[steambrowser.net](https://www.steambrowser.net)** — a web index of every file in the leak. It
+opens the VPKs and reads what is inside them, so you can look through the contents of a depot in a
+browser without downloading anything at all.
+
+**[steam2-db.pages.dev](https://steam2-db.pages.dev/)** — a second web index of the same kind, and
+a useful cross-check when one of them is missing something.
+
+**[valves-2pacalypse](https://archive.org/details/valves-2pacalypse)** on archive.org — an archive
+of everything notable to come out of the Steam2 depot leaks, beyond the depots themselves.
+
+**[dr3murr/steam2-winfsp](https://github.com/dr3murr/steam2-winfsp)** — mounts `.blob` and `.dat`
+archives as an ordinary filesystem through WinFsp on Windows or FUSE3 on Linux, decoding chunks on
+demand. Nothing is extracted: it resolves depot ancestry, pairs the DATs, composes the overlay and
+launches the build straight from the mounted tree. Run a game without unpacking it first. Its depot
+label table is also where this app gets most of its product names — see [Credits](#credits).
 
 ## Things worth knowing about the archive
 
@@ -138,6 +200,21 @@ Please mirror and seed it.
 
 Linux support was contributed by [SkyKingPX](https://github.com/SkyKingPX) in
 [#6](https://github.com/extremebleem/steam2_downloader/pull/6).
+
+The linux-arm64 build was contributed by [MatveyKostis](https://github.com/MatveyKostis), written by
+[Hermes Agent](https://github.com/NousResearch/hermes-agent) — so a release now exists for a
+Raspberry Pi or an arm64 VPS, which is the sort of small always-on box a 13 TB archive gets pulled
+on. The SDK cross-compiles it on the existing Windows runner, so there is no second job and no ARM
+hardware in CI; the artifact was checked on an actual aarch64 machine, where it serves the interface
+and loads the catalog.
+
+The piece picker that made sharing practical was contributed by
+[Chopper1337](https://github.com/Chopper1337) in
+[#8](https://github.com/extremebleem/steam2_downloader/pull/8). Selecting files one at a time
+through MonoTorrent's own API costs about 4 ms each, which over 116 346 files is eight and a half
+minutes before sharing can begin; the picker holds the selection itself instead. Bundling the
+torrent into the release came from the same contributor in
+[#7](https://github.com/extremebleem/steam2_downloader/pull/7).
 
 Depot names come from [dr3murr/steam2-winfsp](https://github.com/dr3murr/steam2-winfsp), whose
 [`data/depot_labels.tsv`](https://github.com/dr3murr/steam2-winfsp/blob/main/data/depot_labels.tsv)

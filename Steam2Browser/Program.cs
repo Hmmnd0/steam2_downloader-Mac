@@ -139,7 +139,25 @@ if (buildIndexAt >= 0)
     return 0;
 }
 
-// ---------------- port ----------------
+// ---------------- address ----------------
+
+// The name the app calls itself in a browser, in place of a bare loopback address.
+//
+// Anything under .localhost is reserved by RFC 6761 and resolved to loopback by the browser itself,
+// so this needs no DNS, no entry in the hosts file, and no administrator: nothing on the machine is
+// changed to make it work, and nothing is left behind. The alternatives all cost more than a nicer
+// address is worth — a hosts entry needs elevation and outlives the app, and mDNS would mean
+// listening on the network rather than on loopback, which is not a trade to make for an app that
+// downloads and writes files.
+//
+// A port still has to appear unless the app is on 80, which cannot be relied on: it is often taken,
+// and an ordinary user on Linux is not allowed to bind it at all. Passing --port=80 drops it and
+// leaves the bare name, wherever that does work.
+const string LocalHostName = "steam2downloader.localhost";
+
+static string AddressFor(int p) => p == 80
+    ? $"http://{LocalHostName}/"
+    : $"http://{LocalHostName}:{p}/";
 
 // Kestrel only discovers a busy port deep inside app.Run(), where the failure surfaces as a wall
 // of stack trace. Settle it here instead: hand the user over to an instance that is already
@@ -177,7 +195,7 @@ if (!PortIsFree(port))
 {
     if (await AnotherInstanceAsync(port))
     {
-        string running = $"http://127.0.0.1:{port}/";
+        string running = AddressFor(port);
         Console.WriteLine($"steam2browser is already running at {running} — opening that one");
 
         if (!noBrowser)
@@ -202,7 +220,11 @@ if (!PortIsFree(port))
 
 var builder = WebApplication.CreateBuilder(new WebApplicationOptions { Args = args, ContentRootPath = baseDir });
 builder.Logging.ClearProviders();
-builder.WebHost.UseUrls($"http://127.0.0.1:{port}");
+// "localhost" rather than 127.0.0.1, which binds both loopback addresses instead of only the IPv4
+// one. A browser resolving steam2.localhost is free to pick ::1, and on an IPv4-only listener that
+// arrives as a refused connection — the name would work on one machine and not the next for a
+// reason nobody could see. Still loopback either way: nothing is reachable from the network.
+builder.WebHost.UseUrls($"http://localhost:{port}");
 builder.Services.ConfigureHttpJsonOptions(o =>
 {
     o.SerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.CamelCase;
@@ -259,14 +281,22 @@ app.MapGet("/api/state", () => new
         settings.BigFileBytes,
         settings.TorrentEnabled,
         settings.SeedDownloaded,
+        settings.SwarmAssist,
+        settings.SharingNoticeSeen,
         settings.VerifyHashes,
         settings.TorrentPort,
+        settings.TorrentUploadKbps,
+        settings.TorrentDownloadKbps,
         settings.ExtractOutDir,
         trackers = settings.TrackersToUse,
     },
+    // Free space where downloads land. Nothing is asked of it here, so needed is zero — this is
+    // the standing figure the settings dialog shows, not a verdict on any one download.
+    disk = Dto.Space(settings.DataDir, 0),
     mirrors = Mirrors.All.Select(m => new
     {
         m.Id, m.Name, m.Region, m.BaseUrl, m.SpeedBps, m.TtfbMs, m.Reachable, m.Error,
+        m.IsTorrent,
         tested = m.TestedUtc,
         active = m.Id == client.Primary.Id,
     }),
@@ -355,6 +385,19 @@ app.MapPost("/api/settings", async (SettingsPatch patch) =>
     if (patch.BlobConcurrency is { } bc) settings.BlobConcurrency = Math.Clamp(bc, 1, 128);
     if (patch.DatConcurrency is { } dc) settings.DatConcurrency = Math.Clamp(dc, 1, 64);
     if (patch.WarmupLookahead is { } wl) settings.WarmupLookahead = Math.Clamp(wl, 0, 16);
+    if (patch.SwarmAssist is { } sa) settings.SwarmAssist = sa;
+    if (patch.SharingNoticeSeen is { } sn)
+    {
+        // Answering the notice is what joins the swarm on a first run, because startup deliberately
+        // does not: see where seeding is started at the bottom of this file. Only ever forward, so
+        // a client that sends this again cannot restart sharing somebody has since switched off.
+        bool firstAnswer = sn && !settings.SharingNoticeSeen;
+        settings.SharingNoticeSeen = sn;
+
+        if (firstAnswer && settings.TorrentEnabled && settings.SeedDownloaded)
+            _ = Task.Run(() => torrent.StartSeedingAsync());
+    }
+
     if (patch.TorrentEnabled is { } te)
     {
         settings.TorrentEnabled = te;
@@ -380,10 +423,27 @@ app.MapPost("/api/settings", async (SettingsPatch patch) =>
         resetTorrent = port != settings.TorrentPort;
         settings.TorrentPort = port;
     }
+
+    // Unlike the port, a speed cap does not need the engine rebuilt — it is pushed into the running
+    // one, so a limit set while an upload is in the way takes effect on that upload.
+    var rateChanged = false;
+    if (patch.TorrentUploadKbps is { } uk)
+    {
+        int v = Math.Max(0, uk);
+        rateChanged |= v != settings.TorrentUploadKbps;
+        settings.TorrentUploadKbps = v;
+    }
+    if (patch.TorrentDownloadKbps is { } dk)
+    {
+        int v = Math.Max(0, dk);
+        rateChanged |= v != settings.TorrentDownloadKbps;
+        settings.TorrentDownloadKbps = v;
+    }
     if (!string.IsNullOrWhiteSpace(patch.DataDir)) settings.DataDir = patch.DataDir!;
     if (!string.IsNullOrWhiteSpace(patch.ExtractOutDir)) settings.ExtractOutDir = patch.ExtractOutDir!;
     if (patch.ExtraTrackers is { } tr) settings.ExtraTrackers = tr;
     settings.Save();
+    if (rateChanged && !resetTorrent) await torrent.ApplyRateLimitsAsync();
     if (resetTorrent) await torrent.ResetAsync();
     return Results.Ok(new { ok = true });
 });
@@ -531,14 +591,24 @@ app.MapGet("/api/depots/{id:int}", (int id) =>
     string blobDir = Path.Combine(settings.DataDir, "blobs");
     string datDir = Path.Combine(settings.DataDir, "dats");
 
+    // Which branch each blob sits on, so that where a version exists twice the card can ask which
+    // branch is wanted instead of which checksum.
+    var (branches, branchOf) = changes.Branches(d);
+
     return Results.Ok(new
     {
         summary = Dto.Summary(d, names.Get(d.Id), names.DisplayFor(d.Id), names.SourceFor(d.Id)),
+        branches = branches.Select(b => new
+        {
+            b.Index, b.HeadCrc, b.MinVersion, b.MaxVersion,
+            b.FirstDate, b.LastDate, b.BlobCount, b.ForksFromVersion,
+        }),
         versions = Enumerable.Range(0, d.MaxVersion + 1).Select(v => new
         {
             version = v,
             dats = d.Dats.Where(e => e.Version == v).Select(e => Dto.File(e, datDir)),
-            blobs = d.Blobs.Where(e => e.Version == v).Select(e => Dto.File(e, blobDir)),
+            blobs = d.Blobs.Where(e => e.Version == v)
+                .Select(e => Dto.File(e, blobDir, branchOf.TryGetValue(e.FileName, out int bi) ? bi : null)),
         }).Where(x => x.dats.Any() || x.blobs.Any()),
     });
 });
@@ -909,7 +979,8 @@ app.MapPost("/api/plan", async (PlanRequest req, CancellationToken ct) =>
     if (cat is null) return Results.BadRequest(new { error = "index not loaded yet" });
 
     var plan = await ChainResolver.ResolveAsync(cat, client, settings.DataDir, req.Depot, req.Version, req.BlobCrc, ct);
-    changes.Prune(plan);
+    plan.FullChain = req.FullChain is true;
+    if (!plan.FullChain) changes.Prune(plan);
     return Results.Ok(Dto.Plan(plan, settings));
 });
 
@@ -919,8 +990,19 @@ app.MapPost("/api/download", async (PlanRequest req, CancellationToken ct) =>
     if (cat is null) return Results.BadRequest(new { error = "index not loaded yet" });
 
     var plan = await ChainResolver.ResolveAsync(cat, client, settings.DataDir, req.Depot, req.Version, req.BlobCrc, ct);
-    changes.Prune(plan);
+    plan.FullChain = req.FullChain is true;
+    if (!plan.FullChain) changes.Prune(plan);
     if (plan.Error is not null || plan.NeedsChoice) return Results.Ok(Dto.Plan(plan, settings));
+
+    // Checked here and not only in the browser. The button that leads here is disabled when the
+    // plan does not fit, but a disabled button is a courtesy, not a guarantee — this endpoint is
+    // also reached by a stale page, a second window, and anything replaying a request — and the
+    // failure it prevents is a full disk part-way through a download that has to start over.
+    if (!Disk.Fits(settings.DataDir, Dto.RemainingBytes(plan, settings), out var space))
+    {
+        plan.Error = Dto.NotEnoughSpace(plan, settings, space);
+        return Results.Ok(Dto.Plan(plan, settings));
+    }
 
     var job = downloads.Start(plan);
     return Results.Ok(new { jobId = job.Id, plan = Dto.Plan(plan, settings) });
@@ -1005,8 +1087,18 @@ _ = Task.Run(async () =>
 
 _ = Task.Run(() => apps.RefreshAsync(Settings.RootFor(baseDir)));
 
-// Both switches have to be on. The engine is off by default while its startup is unexplained.
-if (settings.TorrentEnabled && settings.SeedDownloaded)
+// Both switches have to be on, and on a first run the notice has to have been answered first.
+//
+// Sharing announces to every tracker it has, which on a machine that has just unzipped the app
+// means contacting well over a hundred hosts within seconds of launch, before the person running it
+// has agreed to anything. That is bad manners on its own, and it is also what an unsigned new
+// executable looks like to a reputation engine: a VirusTotal sandbox recorded 117 contacted domains
+// on first run, and Kaspersky answered with UDS:Trojan.Win64.SBadur.gen — a cloud verdict on
+// behaviour, not a signature on anything in the file.
+//
+// So the first run is quiet. The notice is shown, and the swarm is joined once somebody has said
+// yes; from then on SharingNoticeSeen is set and startup shares as before.
+if (settings.TorrentEnabled && settings.SeedDownloaded && settings.SharingNoticeSeen)
     _ = Task.Run(() => torrent.StartSeedingAsync());
 
 _ = Task.Run(async () =>
@@ -1026,12 +1118,20 @@ _ = Task.Run(async () =>
     try
     {
         await Mirrors.TestAllAsync(http);
-        var best = Mirrors.All.Where(m => !m.IsTorrent && m.Reachable && m.SpeedBps > 0).MaxBy(m => m.SpeedBps);
-        if (best is not null && best.Id != client.Primary.Id)
+
+        // Racing the HTTP mirrors says nothing about the swarm, so someone who chose the swarm is
+        // left on it. Without this the race quietly moved them back to an HTTP mirror a few seconds
+        // into every start, and the only symptom was that picking the torrent never seemed to do
+        // anything — which is exactly what it looked like from the outside.
+        if (!client.Primary.IsTorrent)
         {
-            client.Primary = best;
-            settings.MirrorId = best.Id;
-            settings.Save();
+            var best = Mirrors.All.Where(m => !m.IsTorrent && m.Reachable && m.SpeedBps > 0).MaxBy(m => m.SpeedBps);
+            if (best is not null && best.Id != client.Primary.Id)
+            {
+                client.Primary = best;
+                settings.MirrorId = best.Id;
+                settings.Save();
+            }
         }
     }
     catch
@@ -1045,8 +1145,13 @@ _ = Task.Run(async () =>
     names.StartSteam(loader.Catalog);
 });
 
-string url = $"http://127.0.0.1:{port}/";
+string url = AddressFor(port);
 Console.WriteLine($"steam2browser  ->  {url}");
+// The numeric address is printed too, and deliberately. Browsers resolve .localhost themselves, but
+// a curl on an unusual resolver, a script, or a machine with an aggressive DNS policy may not — and
+// somebody staring at a name that will not open needs the address that always works on the line
+// below, not in an issue thread.
+Console.WriteLine($"               or  http://127.0.0.1{(port == 80 ? "" : $":{port}")}/");
 Console.WriteLine($"data dir: {settings.DataDir}");
 Console.WriteLine("press Ctrl+C to stop");
 
@@ -1096,11 +1201,12 @@ static void OpenWithDefaultApplication(string target)
 }
 
 internal sealed record SettingsPatch(
-    string? MirrorId, bool? Failover, int? Concurrency, bool? VerifyHashes, bool? PhasedDownloads, bool? TorrentEnabled, int? BlobConcurrency, int? DatConcurrency, int? WarmupLookahead, int? BigFileMb,
-    int? TorrentPort, string? DataDir, string? ExtractOutDir, string[]? ExtraTrackers);
+    string? MirrorId, bool? Failover, int? Concurrency, bool? VerifyHashes, bool? PhasedDownloads, bool? TorrentEnabled, bool? SwarmAssist, bool? SharingNoticeSeen, int? BlobConcurrency, int? DatConcurrency, int? WarmupLookahead, int? BigFileMb,
+    int? TorrentPort, int? TorrentUploadKbps, int? TorrentDownloadKbps,
+    string? DataDir, string? ExtractOutDir, string[]? ExtraTrackers);
 
 internal sealed record ReloadRequest(bool Refresh, bool Sizes);
-internal sealed record PlanRequest(int Depot, int Version, string? BlobCrc);
+internal sealed record PlanRequest(int Depot, int Version, string? BlobCrc, bool? FullChain);
 internal sealed record BlobRangeRequest(int From, int To);
 internal sealed record InstallRequest(int Appid, string Build, List<int>? Depots);
 internal sealed record SeedRequest(bool Enabled);
@@ -1109,6 +1215,46 @@ internal sealed record RevealRequest(string Path);
 
 internal static class Dto
 {
+    /// <summary>
+    /// Bytes a plan still has to fetch. Files already on disk are not downloaded again, so they are
+    /// not counted against the free space either.
+    /// </summary>
+    public static long RemainingBytes(ChainPlan p, Settings s) => p.Files
+        .Where(f => !System.IO.File.Exists(Path.Combine(s.DataDir, f.Entry.DirName, f.Entry.FileName)))
+        .Sum(f => f.Size);
+
+    /// <summary>
+    /// Free space where downloads land, and whether <paramref name="needed"/> bytes fit in it.
+    /// </summary>
+    public static object Space(string dir, long needed)
+    {
+        var d = Disk.For(dir);
+        return new
+        {
+            root = d.Root,
+            free = d.FreeBytes,
+            total = d.TotalBytes,
+            used = d.UsedBytes,
+            headroom = Disk.Headroom,
+            error = d.Error,
+            // Null when the drive could not be measured, which the UI shows as "unknown" rather
+            // than blocking on a number it does not have.
+            fits = d.Error is not null ? (bool?)null : d.FreeBytes >= needed + Disk.Headroom,
+            needed,
+        };
+    }
+
+    public static string NotEnoughSpace(ChainPlan p, Settings s, DiskSpace space)
+    {
+        long needed = RemainingBytes(p, s);
+        return $"not enough free space on {space.Root}: {Fmt(needed)} to download plus "
+             + $"{Fmt(Disk.Headroom)} kept free, but {Fmt(space.FreeBytes)} is available";
+    }
+
+    private static string Fmt(long b) => b >= 1_000_000_000L
+        ? $"{b / 1_000_000_000d:0.##} GB"
+        : $"{b / 1_000_000d:0.##} MB";
+
     public static object Summary(Depot d, NameRecord? name = null, string? display = null, string? source = null) => new
     {
         id = d.Id,
@@ -1138,7 +1284,7 @@ internal static class Dto
         missingBlobs = d.MissingBlobs,
     };
 
-    public static object File(Entry e, string localDir) => new
+    public static object File(Entry e, string localDir, int? branch = null) => new
     {
         name = e.FileName,
         depot = e.Depot,
@@ -1149,6 +1295,9 @@ internal static class Dto
         size = e.ApproxSize,
         date = e.Date == default ? null : e.Date.ToString("yyyy-MM-dd HH:mm:ss"),
         local = System.IO.File.Exists(Path.Combine(localDir, e.FileName)),
+        // Which branch this blob belongs to, so a fork can be offered as a choice between branches
+        // rather than between two checksums that mean nothing on their own.
+        branch,
     };
 
     public static object Plan(ChainPlan p, Settings s) => new
@@ -1168,11 +1317,16 @@ internal static class Dto
         blobCount = p.Files.Count(f => f.Entry.Kind == Kind.Blob),
         alreadyLocal = p.Files.Count(f =>
             System.IO.File.Exists(Path.Combine(s.DataDir, f.Entry.DirName, f.Entry.FileName))),
+        remainingBytes = RemainingBytes(p, s),
+        // Everything the button needs to explain itself: how much room there is, and whether this
+        // particular download fits in it.
+        disk = Space(s.DataDir, RemainingBytes(p, s)),
         extractArgs = p.ExtractArgs,
         // Null when it could not be worked out yet, which the UI reports rather than hiding.
         skippedDats = p.SkippedDats,
         skippedBytes = p.SkippedBytes,
         chainDats = p.ChainDats,
+        fullChain = p.FullChain,
         files = p.Files.Take(2000).Select(f => new
         {
             name = f.Entry.FileName,

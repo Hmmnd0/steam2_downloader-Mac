@@ -8,10 +8,41 @@
     <AssemblyName>steam2browser</AssemblyName>
     <InvariantGlobalization>true</InvariantGlobalization>
     <GenerateEmbeddedFilesManifest>true</GenerateEmbeddedFilesManifest>
-    <PublishSingleFile>true</PublishSingleFile>
+    <!-- Not a single file: see the release workflow for why. -->
+    <PublishSingleFile>false</PublishSingleFile>
     <SelfContained>false</SelfContained>
     <RuntimeIdentifiers>win-x64;linux-x64</RuntimeIdentifiers>
     <ServerGarbageCollection>true</ServerGarbageCollection>
+  </PropertyGroup>
+
+  <!--
+    Identity, in the Win32 version resource every Windows executable carries.
+
+    Without this the fields are filled in from the assembly name, so the file claimed to be produced
+    by "steam2browser", to be a product called "steam2browser", described as "steam2browser", with
+    an empty copyright and a version of 1.0.0.0 that never changed between releases. Real software
+    does not look like that, and unsigned software with no identity is a large part of what a
+    reputation engine has to go on: Kaspersky's UDS heuristics flagged the release as
+    UDS:Trojan.Win64.SBadur.gen, which is a cloud verdict on behaviour and reputation rather than a
+    signature match on anything in the file.
+
+    This is not a cure on its own — that is an Authenticode signature, which costs money and an
+    identity check — but it removes one of the reasons to be suspicious, and it makes the version in
+    the file agree with the release it came from. The release workflow passes the tag in as Version.
+  -->
+  <PropertyGroup>
+    <Company>extremebleem</Company>
+    <Authors>extremebleem</Authors>
+    <Product>Steam2 Downloader</Product>
+    <!-- FileDescription in the Win32 resource comes from this, not from Description. -->
+    <AssemblyTitle>Steam2 Downloader</AssemblyTitle>
+    <Description>Browses, downloads and extracts depots from the terarelease Steam2 archive.</Description>
+    <Copyright>Copyright (c) extremebleem. MIT licensed.</Copyright>
+    <PackageProjectUrl>https://github.com/extremebleem/steam2_downloader</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/extremebleem/steam2_downloader</RepositoryUrl>
+
+    <!-- Overridden by the release build with the tag it is about to publish. -->
+    <Version Condition="'$(Version)' == ''">1.0.0</Version>
   </PropertyGroup>
 
   <ItemGroup>

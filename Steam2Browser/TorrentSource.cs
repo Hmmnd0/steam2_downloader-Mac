@@ -94,9 +94,70 @@ public sealed class TorrentSource(Settings settings)
     private IReadOnlyList<ITorrentManagerFile> _selection = Array.Empty<ITorrentManagerFile>();
 
     /// <summary>
+    /// Set when sharing wanted to take stock of the disk but a download was using the manager, so
+    /// the work is done once that download is out of the way instead of on top of it.
+    /// </summary>
+    private volatile bool _seedRefreshPending;
+
+    /// <summary>
+    /// Whether sharing is still wanted by the time each stage of starting it finishes.
+    ///
+    /// Starting takes a while — reading the file list, linking, then hashing what was linked — and
+    /// the switch can be thrown at any point during it, which is exactly what happens when someone
+    /// is shown the notice on first run and says no. Stopping could not reach a start that had not
+    /// finished, because the manager it looks for is only published at the very end, so the start
+    /// ran to completion and announced itself as sharing over the top of the refusal. Sharing after
+    /// being told not to is not a glitch to tidy up later, so every stage checks this before going
+    /// on and the last one checks it before committing.
+    /// </summary>
+    private volatile bool _seedWanted;
+
+    /// <summary>
+    /// Sharing was asked for and has not since been called off.
+    /// </summary>
+    private bool SeedStillWanted => _seedWanted && settings.TorrentEnabled && settings.SeedDownloaded;
+
+    /// <summary>Leaves the display saying what is true: sharing was asked for and then was not.</summary>
+    private void CallOff()
+    {
+        _seedManager = null;
+        Status.SeedState = "off";
+        Status.SeedMessage = "";
+        Status.SeedFiles = 0;
+        Status.SeedBytes = 0;
+        Status.SeedUploadRate = 0;
+        Status.SeedPeers = 0;
+    }
+
+    /// <summary>
+    /// Whether a download currently owns the manager.
+    ///
+    /// Downloading and sharing are the same manager and the same picker, and sharing's half of that
+    /// begins by clearing the selection and stopping the manager. Doing so while a download is in
+    /// flight takes away both the files it asked for and the engine fetching them, and the download
+    /// then sits at zero forever because nothing is left to tell it otherwise. That is what made
+    /// downloading over the torrent look broken to anyone who left sharing on — which is everyone,
+    /// since it is on by default.
+    /// </summary>
+    private bool DownloadInFlight => _selection.Count > 0;
+
+    /// <summary>
     /// Ready means the file list is known and the selection picker is on: without the picker a
     /// download would select files the manager knows nothing about and start on all 13.32 TB.
     /// </summary>
+    /// <summary>
+    /// Where the engine is allowed to write.
+    ///
+    /// Inside the download directory rather than beside the index, because sharing hard-links
+    /// archive files into it and a hard link cannot cross a volume. Anyone keeping the archive on a
+    /// second drive — which is most of the reason to change that setting at all — would otherwise
+    /// share nothing, and silently, because every link would simply fail.
+    ///
+    /// Inside it rather than next to it, so it can never land at the root of someone's drive. Its
+    /// own dats/ and blobs/ sit a level below the archive's, so the two never meet.
+    /// </summary>
+    private string EngineDirectory => Path.Combine(settings.DataDir, "torrent-data");
+
     public bool Ready => _manager is { HasMetadata: true } && _requester is not null;
 
     // ---------------- startup ----------------
@@ -117,6 +178,23 @@ public sealed class TorrentSource(Settings settings)
     ///
     /// Nothing is downloaded by this manager. It hash-checks what is there and serves it.
     /// </summary>
+    /// <summary>
+    /// Shares the archive files already on disk back to the swarm.
+    ///
+    /// There is one manager, not two: MonoTorrent refuses a second manager for the same infohash
+    /// ("A manager for this torrent has already been registered"), so sharing cannot have an engine
+    /// of its own pointed at the archive.
+    ///
+    /// So the download manager does both, and the files reach it as hard links. Its own directory
+    /// stays the one place the engine may write — the archive is never handed to it, which is what
+    /// keeps the empty files MonoTorrent creates at startup out of the depot data the rest of the
+    /// app reads. A link costs no space and no copy, and removing one leaves the original alone.
+    ///
+    /// With the picker selecting nothing, a running manager asks the swarm for no piece at all
+    /// while still serving every piece it holds. That is exactly a seeder, and it is why sharing
+    /// and downloading can share a manager: a download selects its chain, and puts the selection
+    /// back to nothing when it is done.
+    /// </summary>
     public async Task StartSeedingAsync(CancellationToken ct = default)
     {
         if (!settings.TorrentEnabled)
@@ -126,17 +204,13 @@ public sealed class TorrentSource(Settings settings)
             return;
         }
 
-        if (_seedManager is not null) return;
-
         await _seedGate.WaitAsync(ct);
         try
         {
-            if (_seedManager is not null) return;
-
             Status.SeedState = "starting";
             Status.SeedMessage = "reading the file list";
+            _seedWanted = true;
 
-            // Sharing needs the metadata, and the download side is what fetches and caches it.
             if (!await EnsureStartedAsync(ct) || _manager is null)
             {
                 Status.SeedState = "error";
@@ -144,66 +218,53 @@ public sealed class TorrentSource(Settings settings)
                 return;
             }
 
-            string archive = settings.DataDir;
-            Directory.CreateDirectory(archive);
+            if (!SeedStillWanted) { CallOff(); return; }
 
-            var torrentSettings = new TorrentSettingsBuilder
-            {
-                CreateContainingDirectory = false,
-                AllowDht = true,
-                AllowPeerExchange = true,
-                // Nothing here should ever ask the swarm for data.
-                UploadSlots = 8,
-            }.ToSettings();
+            Status.SeedMessage = "linking what is already downloaded";
+            var (linked, bytes) = LinkArchiveIntoTorrentData();
 
-            var manager = await _engine!.AddAsync(_manager.Torrent!, archive, torrentSettings);
+            if (!SeedStillWanted) { CallOff(); return; }
 
-            // Park everything first, before a single byte can be allocated.
-            foreach (var file in manager.Files)
-                if (file.Priority != Priority.DoNotDownload)
-                    await manager.SetFilePriorityAsync(file, Priority.DoNotDownload);
-
-            // Then lift only what is genuinely on disk.
-            int have = 0;
-            long bytes = 0;
-
-            foreach (var file in manager.Files)
-            {
-                var parts = file.Path.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries);
-                if (parts.Length < 2) continue;
-
-                string name = parts[^1];
-                string folder = parts[^2].ToLowerInvariant();
-                if (folder is not ("dats" or "blobs")) continue;
-
-                string onDisk = Path.Combine(archive, folder, name);
-                if (!File.Exists(onDisk)) continue;
-
-                // A part-written file is not ours to serve.
-                if (new FileInfo(onDisk).Length != file.Length) continue;
-
-                await manager.SetFilePriorityAsync(file, Priority.Normal);
-                have++;
-                bytes += file.Length;
-            }
-
-            Status.SeedFiles = have;
+            Status.SeedFiles = linked;
             Status.SeedBytes = bytes;
 
-            if (have == 0)
+            if (linked == 0)
             {
                 Status.SeedState = "idle";
-                Status.SeedMessage = "nothing downloaded yet to share";
-                await _engine.RemoveAsync(manager);
+                // The sweep's own account of what it rejected is left in place: at zero that is the
+                // only thing worth reading, and a friendlier sentence would hide it.
                 return;
             }
 
-            Status.SeedMessage = $"checking {have} file(s) before sharing them";
-            await manager.HashCheckAsync(autoStart: true);
+            if (DownloadInFlight)
+            {
+                Status.SeedMessage = "waiting for the download to finish before sharing";
+                _seedRefreshPending = true;
+                return;
+            }
 
-            _seedManager = manager;
+            // The manager has to look at the links to know it holds those pieces. Nothing is
+            // selected, so this cannot turn into a download.
+            Status.SeedMessage = $"checking {linked} file(s) before sharing them";
+            _requester?.SelectNone();
+
+            if (_manager.State != TorrentState.Stopped)
+                await _manager.StopAsync(TimeSpan.FromSeconds(10));
+
+            await _manager.HashCheckAsync(autoStart: true);
+
+            // The hash check cannot be interrupted part way, so a refusal that arrived during it is
+            // honoured here instead: the manager is put back down and nothing is ever offered.
+            if (!SeedStillWanted)
+            {
+                try { await _manager.StopAsync(TimeSpan.FromSeconds(10)); } catch { }
+                CallOff();
+                return;
+            }
+
+            _seedManager = _manager;
             Status.SeedState = "sharing";
-            Status.SeedMessage = $"sharing {have} file(s)";
+            Status.SeedMessage = $"sharing {linked} file(s)";
         }
         catch (Exception ex)
         {
@@ -216,11 +277,215 @@ public sealed class TorrentSource(Settings settings)
         }
     }
 
+    /// <summary>
+    /// Clears out the engine directory an earlier build kept beside the index.
+    ///
+    /// Everything in it is reconstructible — hard links to archive files, and the empty files
+    /// MonoTorrent lays down at startup — so this removes rather than moves. Left alone it would
+    /// strand tens of thousands of stray files next to the index for good.
+    /// </summary>
+    private void MigrateEngineDirectory(string current)
+    {
+        try
+        {
+            string old = Path.Combine(settings.IndexDir, "torrent-data");
+            if (!Directory.Exists(old)) return;
+            if (Path.GetFullPath(old).Equals(Path.GetFullPath(current), StringComparison.OrdinalIgnoreCase))
+                return;
+
+            int files = Directory.EnumerateFiles(old, "*", SearchOption.AllDirectories).Count();
+            Directory.Delete(old, recursive: true);
+            Status.Message = $"cleared {files} file(s) from the old torrent working directory";
+        }
+        catch
+        {
+            // Cosmetic. A leftover directory costs disk space, never correctness.
+        }
+    }
+
+    /// <summary>
+    /// Makes <paramref name="link"/> a second name for the bytes of <paramref name="existing"/>.
+    ///
+    /// .NET has no hard-link API — it offers symbolic links, which on Windows need elevation unless
+    /// developer mode is on — so this calls the platform. A hard link is the right shape here: no
+    /// second copy of the data, and deleting one name never touches the other, which is what keeps
+    /// the engine's directory from being able to harm the archive.
+    /// </summary>
+    private static bool TryHardLink(string existing, string link)
+    {
+        try
+        {
+            if (OperatingSystem.IsWindows()) return CreateHardLinkW(link, existing, IntPtr.Zero);
+            return LinkUnix(existing, link) == 0;
+        }
+        catch (DllNotFoundException)
+        {
+            return false;
+        }
+        catch (EntryPointNotFoundException)
+        {
+            return false;
+        }
+    }
+
+    // DllImport rather than the source-generated LibraryImport: the generator emits unsafe code and
+    // would mean turning AllowUnsafeBlocks on for the whole project to declare two functions. These
+    // are called once per file while sharing starts, so the older marshalling costs nothing here.
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", EntryPoint = "CreateHardLinkW",
+        CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+    [return: System.Runtime.InteropServices.MarshalAs(
+        System.Runtime.InteropServices.UnmanagedType.Bool)]
+    private static extern bool CreateHardLinkW(string lpFileName, string lpExistingFileName,
+                                               IntPtr lpSecurityAttributes);
+
+    [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "link",
+        CharSet = System.Runtime.InteropServices.CharSet.Ansi, SetLastError = true)]
+    private static extern int LinkUnix(string oldpath, string newpath);
+
+    /// <summary>
+    /// Hard-links every complete archive file into the engine's own directory, and reports how many
+    /// and how much. Files already linked are left alone, so this is cheap to call again.
+    ///
+    /// A part-written file is skipped: its length will not match, and offering a peer bytes that
+    /// have not been verified is worse than offering nothing.
+    /// </summary>
+    private (int Linked, long Bytes) LinkArchiveIntoTorrentData()
+    {
+        string archive = settings.DataDir;
+        string engineDir = EngineDirectory;
+
+        int linked = 0;
+        long bytes = 0;
+
+        // Counted per rejection reason. A sweep that links nothing has to be able to say why, and
+        // guessing at it from the outside cost a great deal of time.
+        int absent = 0, wrongSize = 0, failed = 0;
+
+        foreach (var (relPath, file) in _byArchivePath)
+        {
+            string source = Path.Combine(archive, relPath.Replace('/', Path.DirectorySeparatorChar));
+            if (!File.Exists(source)) { absent++; continue; }
+
+            var info = new FileInfo(source);
+            if (info.Length != file.Length) { wrongSize++; continue; }
+
+            string target = Path.Combine(engineDir, relPath.Replace('/', Path.DirectorySeparatorChar));
+
+            try
+            {
+                // Anything already there is replaced rather than trusted. A file of the right length
+                // is not proof of the right file, and treating it as one hid a real fault: with the
+                // archive on another drive every link failed, while leftovers from an earlier run
+                // made the sweep report 77 files shared when it had linked none of them.
+                if (File.Exists(target)) File.Delete(target);
+
+                Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+                if (!TryHardLink(source, target)) { failed++; continue; }
+
+                linked++;
+                bytes += info.Length;
+            }
+            catch
+            {
+                // One file that cannot be linked costs its own sharing, not the whole sweep.
+                failed++;
+            }
+        }
+
+        // Written for whoever is reading the button, not for whoever was debugging the sweep. The
+        // normal result is "most of the archive is not on this disk", which is not news and should
+        // not be reported as though it were: absent is only interesting when nothing linked at all.
+        // The counts that mean something went wrong are still said, and only then.
+        var trouble = new List<string>();
+        if (wrongSize > 0) trouble.Add($"{wrongSize} the wrong size");
+        if (failed > 0) trouble.Add($"{failed} could not be linked");
+        if (linked == 0 && absent > 0) trouble.Add($"none of the {_byArchivePath.Count} are on this disk");
+
+        Status.SeedMessage = trouble.Count > 0
+            ? $"linked {linked} file(s) — {string.Join(", ", trouble)}"
+            : $"linked {linked} file(s)";
+
+        return (linked, bytes);
+    }
+
+    /// <summary>
+    /// Takes files downloaded since sharing started into the share, without a restart.
+    ///
+    /// This is the whole point of sharing being on by default: someone who has just pulled a depot
+    /// through the mirrors is, at that moment, the only new source of it in the swarm. Waiting for
+    /// them to restart the app before they can pass it on wastes exactly the moment when they are
+    /// most useful, and the swarm is small enough that every additional source counts.
+    ///
+    /// Cheap when nothing is new: linking skips what is already linked, and the hash check — the
+    /// expensive part — only runs when the share actually grew.
+    /// </summary>
+    public async Task RefreshSharingAsync(CancellationToken ct = default)
+    {
+        if (!settings.TorrentEnabled || !settings.SeedDownloaded) return;
+        if (_manager is null) return;
+
+        await _seedGate.WaitAsync(ct);
+        try
+        {
+            int before = Status.SeedFiles;
+            var (linked, bytes) = LinkArchiveIntoTorrentData();
+
+            Status.SeedFiles = linked;
+            Status.SeedBytes = bytes;
+
+            if (linked <= before)
+            {
+                Status.SeedMessage = $"sharing {linked} file(s)";
+                return;
+            }
+
+            if (DownloadInFlight)
+            {
+                // The new files are not going anywhere. Taking them in costs a stop and a hash
+                // check, and doing that now would kill the download that is still running.
+                _seedRefreshPending = true;
+                return;
+            }
+
+            Status.SeedMessage = $"taking {linked - before} new file(s) into the share";
+
+            // Nothing may be requested while this happens; the check is only there to notice what
+            // arrived.
+            _requester?.SelectNone();
+
+            if (_manager.State != TorrentState.Stopped)
+                await _manager.StopAsync(TimeSpan.FromSeconds(10));
+
+            await _manager.HashCheckAsync(autoStart: true);
+
+            _seedManager = _manager;
+            Status.SeedState = "sharing";
+            Status.SeedMessage = $"sharing {linked} file(s)";
+        }
+        catch (Exception ex)
+        {
+            Status.SeedMessage = $"could not take new files into the share: {ex.Message}";
+        }
+        finally
+        {
+            _seedGate.Release();
+        }
+    }
+
     public async Task StopSeedingAsync()
     {
+        // Said first, so that a start still working its way through the stages sees it and gives
+        // up. Without it the refusal reached only a start that had already finished — the manager
+        // below is not published until the last line of one — and a start still running carried on
+        // to the end and announced itself as sharing over the top of the refusal.
+        _seedWanted = false;
+        _seedRefreshPending = false;
+
         // Status is cleared first and unconditionally. There may be no manager yet — sharing spends
         // its first stretch inside EnsureStartedAsync — and returning early there used to leave the
         // display insisting it was still starting long after it had been switched off.
+        // The same manager the download path uses, so it is released rather than stopped: pulling
+        // it down here would take the downloader with it.
         var manager = _seedManager;
         _seedManager = null;
 
@@ -234,6 +499,36 @@ public sealed class TorrentSource(Settings settings)
         if (manager is null) return;
 
         try { await manager.StopAsync(); } catch { /* going away regardless */ }
+    }
+
+    /// <summary>
+    /// Pushes the current speed caps into a running engine.
+    ///
+    /// Rate limits are the one setting people reach for while something is happening — the upload
+    /// is in the way of a call, or a download is taking the whole line — so requiring a restart to
+    /// apply them would miss the moment they are needed. Nothing to do if the engine is not up:
+    /// the caps are read again when it starts.
+    /// </summary>
+    public async Task ApplyRateLimitsAsync()
+    {
+        var engine = _engine;
+        if (engine is null) return;
+
+        try
+        {
+            var builder = new EngineSettingsBuilder(engine.Settings)
+            {
+                MaximumUploadRate = settings.TorrentUploadKbps * 1000,
+                MaximumDownloadRate = settings.TorrentDownloadKbps * 1000,
+            };
+
+            await engine.UpdateSettingsAsync(builder.ToSettings());
+        }
+        catch
+        {
+            // The caps are advisory. Failing to tighten one is not a reason to disturb whatever the
+            // engine is doing, and the new value still takes effect on the next start.
+        }
     }
 
     public void SampleSeed()
@@ -284,6 +579,11 @@ public sealed class TorrentSource(Settings settings)
                     AutoSaveLoadFastResume = true,
                     AutoSaveLoadDhtCache = true,
                     MaximumConnections = 200,
+
+                    // Zero is MonoTorrent's own "no limit", which is also this app's default, so
+                    // the unlimited case needs no special handling here.
+                    MaximumUploadRate = settings.TorrentUploadKbps * 1000,
+                    MaximumDownloadRate = settings.TorrentDownloadKbps * 1000,
                 };
 
                 if (settings.TorrentPort > 0)
@@ -296,19 +596,28 @@ public sealed class TorrentSource(Settings settings)
                     builder.DhtEndPoint = new IPEndPoint(IPAddress.Any, settings.TorrentPort);
                 }
 
-                _engine = new ClientEngine(builder.ToSettings());
+                // The disk layer is wrapped so that reading a file this machine does not have stops
+                // at the wrapper instead of creating an empty one on the way down. See
+                // ArchivePieceWriter: without it the startup hash check left about thirty thousand
+                // placeholders behind, one for every file in the torrent it looked for and missed.
+                var factories = Factories.Default
+                    .WithPieceWriterCreator(maxOpenFiles =>
+                        new ArchivePieceWriter(Factories.Default.CreatePieceWriter(maxOpenFiles)));
+
+                _engine = new ClientEngine(builder.ToSettings(), factories);
             }
 
             if (_manager is null)
             {
                 string? torrentPath = FindTorrentFile();
 
-                // The engine gets its own directory rather than the archive folder. It allocates
-                // files for whatever is selected, and the archive must only ever contain files this
-                // app has verified — mixing the two made 35 166 empty placeholders look like
+                // A directory of its own, never the archive itself: the engine allocates files for
+                // whatever it is given, and the archive must only ever hold files this app has
+                // verified — mixing the two once made 35 166 empty placeholders look like
                 // completed downloads.
-                string dataDir = Path.Combine(settings.IndexDir, "torrent-data");
+                string dataDir = EngineDirectory;
                 Directory.CreateDirectory(dataDir);
+                MigrateEngineDirectory(dataDir);
 
                 var torrentSettings = new TorrentSettingsBuilder
                 {
@@ -583,7 +892,35 @@ public sealed class TorrentSource(Settings settings)
         Status.State = "ready";
         Status.Message = $"finished {selected.Count - missing.Count} of {selected.Count} files";
 
+        // The manager is free again, so anything sharing put off while it was busy runs now.
+        _ = RunPendingSeedRefreshAsync();
+
         return missing;
+    }
+
+    /// <summary>
+    /// Does the sharing work that was deferred while a download held the manager.
+    ///
+    /// Which of the two it is depends on how far sharing had got: one that never finished starting
+    /// has to start, and one already sharing only needs to notice what arrived.
+    /// </summary>
+    private async Task RunPendingSeedRefreshAsync()
+    {
+        if (!_seedRefreshPending) return;
+        _seedRefreshPending = false;
+
+        if (!settings.TorrentEnabled || !settings.SeedDownloaded) return;
+
+        try
+        {
+            if (Status.SeedState == "sharing") await RefreshSharingAsync(CancellationToken.None);
+            else await StartSeedingAsync();
+        }
+        catch
+        {
+            // Sharing failing to catch up is not the download's problem, and the next completed
+            // download tries again.
+        }
     }
 
     /// <summary>
@@ -626,6 +963,11 @@ public sealed class TorrentSource(Settings settings)
         Status.UploadRate = manager.Monitor.UploadRate;
         Status.SelectedProgress = SelectionProgress();
         Status.TorrentState = manager.State.ToString();
+
+        // Counted from the manager rather than set once while building a magnet link, which left it
+        // reading zero for every start that loaded the torrent from a file — the usual path.
+        try { Status.Trackers = manager.TrackerManager.Tiers.Sum(t => t.Trackers.Count); }
+        catch { /* a count is not worth disturbing a sample for */ }
     }
 
     /// <summary>

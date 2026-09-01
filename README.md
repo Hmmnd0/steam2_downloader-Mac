@@ -1,5 +1,10 @@
 # Steam2 Archive Browser
 
+[![Latest release](https://img.shields.io/github/v/release/Hmmnd0/steam2_downloader-Mac?label=release&color=4c8b2b)](https://github.com/Hmmnd0/steam2_downloader-Mac/releases/latest)
+[![Total downloads](https://img.shields.io/github/downloads/Hmmnd0/steam2_downloader-Mac/total?label=downloads&color=4c8b2b)](https://github.com/Hmmnd0/steam2_downloader-Mac/releases)
+[![Build status](https://github.com/Hmmnd0/steam2_downloader-Mac/actions/workflows/release.yml/badge.svg)](https://github.com/Hmmnd0/steam2_downloader-Mac/actions/workflows/release.yml)
+![macOS, Apple Silicon](https://img.shields.io/badge/platform-macOS%20(Apple%20Silicon)-555)
+
 A browser for the [terarelease](https://de.steam2.download/) Steam2 content dump — 10 876 depots,
 116 339 files, 13.3 TB (12.1 TiB). It shows what the archive holds, works out exactly which files a
 given depot version needs, downloads them, verifies them and unpacks them.
